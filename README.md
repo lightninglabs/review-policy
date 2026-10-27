@@ -7,8 +7,9 @@ The repository ruleset asks for one approval. This check raises that bar for
 riskier PRs. It makes no model calls and never runs PR code, and it reaches
 the same answer every time for the same inputs.
 
-> **Status:** design. The implementation is tracked in
-> [#1](https://github.com/lightninglabs/review-policy/issues/1).
+> **Status:** v1 implemented (tracked in
+> [#1](https://github.com/lightninglabs/review-policy/issues/1)). Not yet
+> deployed to any repository.
 
 ## The policy at a glance
 
@@ -157,34 +158,123 @@ Changing `.github/review-policy.yml` itself is always treated as CRITICAL.
 | Experts | Applies only if the expert is the PR author and every floored path the PR touches matches one of their globs |
 | Never auto-approve | If any changed path matches, a bot approval satisfies nothing |
 
+### Implementation details
+
+Where the design above leaves room, v1 does this:
+
+- **Labels** are `severity-low`, `-medium`, `-high`, `-critical`. If several
+  valid ones are present, the highest wins. "The classifier workflow" is the
+  `github-actions[bot]` account.
+- **Approvers** must have write access to count as humans, as GitHub itself
+  requires. `COMMENTED` reviews don't change a reviewer's latest state, as on
+  GitHub; `CHANGES_REQUESTED` and dismissals do.
+- **`bot: true`** on a tier adds one approval that the bot or another human can
+  give. So LOW needs the bot or one human.
+- **Experts** get relief only if the PR touches at least one floored path and
+  doesn't edit the policy file.
+- **The policy file** counts as a CRITICAL floored path and a
+  never-auto-approve path, whatever the config says.
+- **Globs** match whole paths: `**` is any number of directories, `*` and `?`
+  stay inside one directory. A pattern without a slash, like `go.mod`, only
+  matches at the root.
+- **The config parser** is built in and accepts a strict YAML subset: block
+  and flow mappings and lists, quoted and plain scalars, comments. Anchors,
+  tags, and block scalars are errors. Unknown keys are errors, so a typo
+  fails closed. Quote globs that start with `*`, and logins inside `[...]`
+  lists, as YAML itself requires.
+- **More than 3000 changed files**, the API's limit, fails the check.
+
 ## Using it in a repository
 
-The check runs from a short workflow on `pull_request_target`, plus
-`pull_request_review` so it re-evaluates when someone approves:
+A workflow on `pull_request_target` runs the check. Review events can't run it
+directly: for fork PRs, `pull_request_review` gets a read-only token, and it
+runs the workflow file from the PR. A second workflow with no permissions
+catches review events, and the first one runs on its completion through
+`workflow_run`, from the default branch:
 
 ```yaml
+# .github/workflows/review-policy.yml
 name: review-policy
 on:
   pull_request_target:
     types: [opened, synchronize, reopened, labeled, unlabeled, ready_for_review]
-  pull_request_review:
-    types: [submitted, dismissed]
+  workflow_run:
+    workflows: [review-policy-trigger]
+    types: [completed]
+  workflow_dispatch:
+    inputs:
+      pr: { description: PR number, required: true }
 permissions:
   contents: read
   pull-requests: read
   checks: write
+concurrency:
+  group: review-policy-${{ github.event.pull_request.number || inputs.pr || github.event.workflow_run.head_sha }}
 jobs:
-  policy:
+  policy:  # don't name the job review-policy; that is the check's name
     runs-on: ubuntu-latest
     steps:
       - uses: lightninglabs/review-policy@<sha>
 ```
+
+```yaml
+# .github/workflows/review-policy-trigger.yml
+name: review-policy-trigger
+on:
+  pull_request_review:
+    types: [submitted, dismissed]
+permissions: {}
+jobs:
+  trigger:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "re-evaluate review-policy"
+```
+
+Labels added with a workflow's `GITHUB_TOKEN` don't trigger other workflows,
+so the severity classifier should re-run the check after it labels a PR:
+`gh workflow run review-policy.yml -f pr=<number>` (needs `actions: write`).
+
+Each run reads the PR's current state from the API, and writes one check run,
+`review-policy`, on the current head commit.
 
 This repository is **private**. Private consumers such as wavelength can use
 the action directly once this repo's Actions access setting allows other org
 repositories. Public repositories such as lnd cannot call a private action, so
 they vendor a pinned copy of the script into their own `.github/` and update it
 with a sync PR.
+
+### Vendoring
+
+`dist/review-policy.mjs` is the whole check in one file with no dependencies.
+Copy it to `.github/review-policy.mjs` and replace the `uses:` step above with:
+
+```yaml
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          sparse-checkout: .github/review-policy.mjs
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
+      - run: node .github/review-policy.mjs
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+```
+
+This checks out only the script, from the default branch, never PR code. It
+needs Node 22 or later, which GitHub's runners have. The copy sits under
+`.github/`, so a sync PR needs human approval.
+
+## Development
+
+```sh
+node --test test/*.test.mjs   # unit and end-to-end tests, no network
+node scripts/build.mjs        # rebuild dist/ after changing src/
+```
+
+`src/policy.mjs` is the pure evaluation; `src/main.mjs` does the GitHub I/O.
+The tests fail if `dist/` is out of date.
 
 Then, in the repository ruleset:
 
