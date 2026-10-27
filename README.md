@@ -7,8 +7,9 @@ The repository ruleset asks for one approval. This check raises that bar for
 riskier PRs. It makes no model calls and never runs PR code, and it reaches
 the same answer every time for the same inputs.
 
-> **Status:** design. The implementation is tracked in
-> [#1](https://github.com/lightninglabs/review-policy/issues/1).
+> **Status:** v1 implemented (tracked in
+> [#1](https://github.com/lightninglabs/review-policy/issues/1)). Not yet
+> deployed to any repository.
 
 ## The policy at a glance
 
@@ -190,6 +191,31 @@ to that repository's paths.
 | Experts | Applies only if the expert is the PR author and every floored path the PR touches matches one of their globs. Lowers the requirement by one, never below one human at CRITICAL. |
 | Never auto-approve | If any changed path matches, a bot approval satisfies nothing |
 
+### Implementation details
+
+Where the design above leaves room, v1 does this:
+
+- **Labels** are `severity-low`, `-medium`, `-high`, `-critical`. If several
+  valid ones are present, the highest wins.
+- **Approvers** must have write access to count as humans, as GitHub itself
+  requires. `COMMENTED` reviews don't change a reviewer's latest state, as on
+  GitHub; `CHANGES_REQUESTED` and dismissals do.
+- **`bot: true`** on a tier adds one approval that the bot or another human can
+  give. So LOW needs the bot or one human.
+- **Experts** get relief only if the PR touches at least one floored path and
+  doesn't edit the policy file.
+- **The policy file** counts as a CRITICAL floored path and a
+  never-auto-approve path, whatever the config says.
+- **Globs** match whole paths: `**` is any number of directories, `*` and `?`
+  stay inside one directory. A pattern without a slash, like `go.mod`, only
+  matches at the root.
+- **The config parser** is built in and accepts a strict YAML subset: block
+  and flow mappings and lists, quoted and plain scalars, comments. Anchors,
+  tags, and block scalars are errors. Unknown keys are errors, so a typo
+  fails closed. Quote globs that start with `*`, and logins inside `[...]`
+  lists, as YAML itself requires.
+- **More than 3000 changed files**, the API's limit, fails the check.
+
 ## Merge queue
 
 Required checks must report on `merge_group` events too, or queued PRs wait
@@ -260,6 +286,16 @@ Then, in the repository ruleset, in **one** change:
 
 Roll it out as a non-required check first and compare its verdicts with real
 merges before making it required.
+
+## Development
+
+```sh
+node --test test/*.test.mjs   # unit and end-to-end tests, no network
+node scripts/build.mjs        # rebuild dist/ after changing src/
+```
+
+`src/policy.mjs` is the pure evaluation; `src/main.mjs` does the GitHub I/O.
+The tests fail if `dist/` is out of date.
 
 ## Open questions
 
