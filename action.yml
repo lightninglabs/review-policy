@@ -1,0 +1,9 @@
+name: review-policy
+description: Require approvals that match a pull request's risk, as a check run named review-policy.
+inputs:
+  token:
+    description: Token with checks:write, contents:read, and pull-requests:read.
+    default: ${{ github.token }}
+runs:
+  using: node24
+  main: dist/review-policy.mjs
