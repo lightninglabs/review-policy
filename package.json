@@ -1,0 +1,13 @@
+{
+  "name": "review-policy",
+  "private": true,
+  "type": "module",
+  "description": "A required check that sets PR approval requirements by risk.",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "build": "node scripts/build.mjs",
+    "test": "node --test test/*.test.mjs"
+  }
+}
