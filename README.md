@@ -180,11 +180,8 @@ jobs:
       - uses: lightninglabs/review-policy@<sha>
 ```
 
-This repository is **private**. Private consumers such as wavelength can use
-the action directly once this repo's Actions access setting allows other org
-repositories. Public repositories such as lnd cannot call a private action, so
-they vendor a pinned copy of the script into their own `.github/` and update it
-with a sync PR.
+This repository is public, so both public repositories such as lnd and
+private ones such as wavelength can pin the action by commit SHA.
 
 Then, in the repository ruleset:
 
