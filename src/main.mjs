@@ -3,21 +3,55 @@
 import { readFileSync, appendFileSync } from 'node:fs';
 import { CONFIG_PATH, parseConfig } from './config.mjs';
 import { createClient } from './github.mjs';
-import { evaluate, actorsToCheck } from './policy.mjs';
+import { installationToken } from './app.mjs';
+import { evaluate, actorsToCheck, staleApprovalCommits, ACTIONS_BOT } from './policy.mjs';
 
 export const CHECK_NAME = 'review-policy';
 
-// prNumbers works out which PRs an event is about.
-export async function prNumbers(client, repo, eventName, event) {
+export const SPOOF_WARNING =
+  '> [!WARNING]\n' +
+  '> Reported with `GITHUB_TOKEN`, not the review-policy App. Any workflow in this ' +
+  'repository can create a check run with this name, so this result can be spoofed. ' +
+  'Set the `app_id` and `private_key` inputs.';
+
+// The compare API lists at most this many files.
+const COMPARE_FILE_LIMIT = 300;
+
+// parseMergeGroupRef reads the base branch and PR number from a merge
+// queue ref, refs/heads/gh-readonly-queue/<base>/pr-<N>-<sha>. It
+// returns null for anything else.
+export function parseMergeGroupRef(ref) {
+  const m = /^refs\/heads\/gh-readonly-queue\/(.+)\/pr-([1-9]\d*)-([0-9a-f]{40}|[0-9a-f]{64})$/.exec(String(ref ?? ''));
+  if (!m || !Number.isSafeInteger(Number(m[2]))) return null;
+  return { base: m[1], number: Number(m[2]), sha: m[3] };
+}
+
+// prTargets works out which PRs an event is about. Each target is
+// {number}, plus for merge_group the commit to report on and the base
+// branch the PR must target.
+export async function prTargets(client, repo, eventName, event) {
+  const nums = (list) => list.map((number) => ({ number }));
   switch (eventName) {
     case 'pull_request_target':
     case 'pull_request':
     case 'pull_request_review':
-      return [event.pull_request?.number].filter(Number.isInteger);
+      return nums([event.pull_request?.number].filter(Number.isInteger));
     case 'workflow_dispatch': {
       const v = String(event.inputs?.pr ?? '');
       if (!/^[1-9]\d*$/.test(v)) throw new Error('workflow_dispatch needs a numeric "pr" input');
-      return [Number(v)];
+      return nums([Number(v)]);
+    }
+    case 'merge_group': {
+      const group = event.merge_group ?? {};
+      const parsed = parseMergeGroupRef(group.head_ref);
+      if (!parsed) throw new MergeGroupError(`cannot read a PR number from merge group ref "${group.head_ref}"`);
+      if (group.base_ref !== undefined && group.base_ref !== `refs/heads/${parsed.base}`) {
+        throw new MergeGroupError(`merge group ref "${group.head_ref}" does not match base "${group.base_ref}"`);
+      }
+      if (!/^[0-9a-f]{40}([0-9a-f]{24})?$/.test(String(group.head_sha))) {
+        throw new MergeGroupError('merge group has no head_sha');
+      }
+      return [{ number: parsed.number, reportSha: group.head_sha, base: parsed.base }];
     }
     case 'workflow_run': {
       // Fork PRs leave pull_requests empty, so also look the head commit
@@ -29,10 +63,19 @@ export async function prNumbers(client, repo, eventName, event) {
         const open = await client.paginate(`/repos/${repo}/pulls`, { query: { state: 'open' } });
         for (const p of open) if (p.head?.sha === run.head_sha) nums.add(p.number);
       }
-      return [...nums].sort((a, b) => a - b);
+      return [...nums].sort((a, b) => a - b).map((number) => ({ number }));
     }
     default:
       throw new Error(`unsupported event "${eventName}"`);
+  }
+}
+
+// MergeGroupError means a merge_group event names no PR the check can
+// evaluate. The run reports a failure on the group's head commit.
+export class MergeGroupError extends Error {
+  constructor(message) {
+    super(message);
+    this.name = 'MergeGroupError';
   }
 }
 
@@ -64,9 +107,25 @@ async function permission(client, repo, login) {
   }
 }
 
+// compareFiles lists the files changed from an approved commit to the
+// head, or returns null if the API cannot compare them.
+async function compareFiles(client, repo, base, head) {
+  if (!/^[0-9a-f]{40}([0-9a-f]{24})?$/.test(String(base))) return null;
+  let d;
+  try {
+    d = await client.request('GET', `/repos/${repo}/compare/${base}...${head}`);
+  } catch (err) {
+    if (err.status === 404 || err.status === 422) return null;
+    throw err;
+  }
+  if (!Array.isArray(d?.files)) return null;
+  const files = d.files.map((f) => ({ filename: f.filename, previous_filename: f.previous_filename }));
+  return { status: d.status, files, complete: files.length < COMPARE_FILE_LIMIT };
+}
+
 // gatherInputs reads everything evaluate() needs from the API. The
 // config comes from the base branch, never from the PR.
-export async function gatherInputs(client, repo, number) {
+export async function gatherInputs(client, repo, number, { appLogin = null } = {}) {
   const pr = await client.request('GET', `/repos/${repo}/pulls/${number}`);
   const [cfg, files, timeline, reviews] = await Promise.all([
     readConfig(client, repo, pr.base.ref),
@@ -91,19 +150,30 @@ export async function gatherInputs(client, repo, number) {
     })),
     author: pr.user?.login,
     headSha: pr.head.sha,
+    baseRef: pr.base.ref,
+    appLogin,
     permissions: {},
+    changesSince: {},
   };
   for (const login of actorsToCheck(input)) {
     input.permissions[login] = await permission(client, repo, login);
   }
+  if (Object.values(input.config?.tiers ?? {}).some((t) => t.carry)) {
+    for (const sha of staleApprovalCommits(input)) {
+      input.changesSince[sha] = await compareFiles(client, repo, sha, input.headSha);
+    }
+  }
   return input;
 }
 
-export function summarize(result) {
+export function summarize(result, { spoofable = false } = {}) {
   const d = result.details ?? {};
-  const lines = [`**${result.pass ? 'PASS' : 'FAIL'}:** ${result.reason}`, ''];
+  const lines = [];
+  if (spoofable) lines.push(SPOOF_WARNING, '');
+  lines.push(`**${result.pass ? 'PASS' : 'FAIL'}:** ${result.reason}`, '');
   const row = (k, v) => lines.push(`| ${k} | ${String(v).replace(/\|/g, '\\|').replace(/\n/g, ' ')} |`);
   lines.push('| | |', '| --- | --- |');
+  if (d.mergeGroup) row('Merge group', `\`${d.mergeGroup.headSha}\`, evaluated as PR #${d.mergeGroup.number}`);
   if (d.headSha) row('Head', `\`${d.headSha}\``);
   if (d.author) row('Author', d.author);
   if (result.severity) row('Severity', result.severity.toUpperCase());
@@ -116,27 +186,32 @@ export function summarize(result) {
   if (d.expert !== undefined) row('Expert rule', d.expert ? 'applies' : 'does not apply');
   if (d.requirement) {
     const r = d.requirement;
-    row('Needs', `${r.humans} human${r.humans === 1 ? '' : 's'}${r.bot ? ' + (bot or another human)' : ''}${r.fresh ? ', on the head commit' : ''}`);
+    const extra = r.total > r.humans ? ' + (bot or another human)' : '';
+    const when = r.fresh ? ', on the head commit' : r.carry === 'low_only' ? ', older approvals carry past low-risk changes only' : '';
+    row('Needs', `${r.humans} human${r.humans === 1 ? '' : 's'}${extra}${when}; bot only on the head commit`);
   }
   if (d.humanApprovals) row('Human approvals', d.humanApprovals.join(', ') || 'none');
+  if (d.carriedApprovals?.length) row('Carried from older commits', d.carriedApprovals.join(', '));
   if (d.botApprovals) row('Bot approvals', d.botApprovals.join(', ') || 'none');
   if (d.ignoredApprovals?.length) row('Ignored approvals', d.ignoredApprovals.map((i) => `${i.login} (${i.why})`).join('; '));
   return lines.join('\n').slice(0, 60000);
 }
 
-export async function writeCheck(client, repo, sha, result) {
+// writeCheck creates the check run on sha, or updates the one this App
+// already created there. slug names the App the token belongs to.
+export async function writeCheck(client, repo, sha, result, { slug = 'github-actions', spoofable = false } = {}) {
   const body = {
     name: CHECK_NAME,
     head_sha: sha,
     status: 'completed',
     conclusion: result.pass ? 'success' : 'failure',
     completed_at: new Date().toISOString(),
-    output: { title: result.reason.slice(0, 255), summary: summarize(result) },
+    output: { title: result.reason.slice(0, 255), summary: summarize(result, { spoofable }) },
   };
   const existing = await client.request('GET', `/repos/${repo}/commits/${sha}/check-runs`, {
     query: { check_name: CHECK_NAME, filter: 'latest', per_page: 100 },
   });
-  const mine = (existing?.check_runs ?? []).find((c) => c.app?.slug === 'github-actions');
+  const mine = (existing?.check_runs ?? []).find((c) => c.app?.slug === slug);
   if (mine) {
     const { name, head_sha, ...patch } = body;
     return client.request('PATCH', `/repos/${repo}/check-runs/${mine.id}`, { body: patch });
@@ -144,26 +219,76 @@ export async function writeCheck(client, repo, sha, result) {
   return client.request('POST', `/repos/${repo}/check-runs`, { body });
 }
 
+// authenticate picks the token to use. With app_id and private_key it
+// mints an installation token for the review-policy App. Without them it
+// falls back to GITHUB_TOKEN, whose check runs any workflow can forge.
+async function authenticate(env, repo, fetch, log) {
+  const apiUrl = env.GITHUB_API_URL || undefined;
+  const appId = String(env.INPUT_APP_ID ?? '').trim();
+  const privateKey = String(env.INPUT_PRIVATE_KEY ?? '');
+  if (appId || privateKey.trim()) {
+    if (!appId) throw new Error('private_key is set but app_id is empty');
+    if (!privateKey.trim()) {
+      throw new Error('app_id is set but private_key is empty; the key is only available to jobs in its environment, from the default branch');
+    }
+    const minted = await installationToken({ appId, privateKey, repo, apiUrl, fetch });
+    log(`::add-mask::${minted.token}`);
+    return { ...minted, apiUrl, spoofable: false };
+  }
+  log('::warning::review-policy: no app_id/private_key; reporting with GITHUB_TOKEN, so the check can be spoofed');
+  return { token: env.INPUT_TOKEN || env.GITHUB_TOKEN, slug: 'github-actions', login: ACTIONS_BOT, apiUrl, spoofable: true };
+}
+
 // run evaluates every PR the event refers to and writes one check run
-// per PR head. It returns the results.
+// per PR head, or on the merge group's head for merge_group. It returns
+// the results.
 export async function run({ env = process.env, fetch = globalThis.fetch, log = console.log } = {}) {
   const repo = env.GITHUB_REPOSITORY;
   if (!repo || !/^[^/]+\/[^/]+$/.test(repo)) throw new Error('GITHUB_REPOSITORY is not set');
-  const token = env.INPUT_TOKEN || env.GITHUB_TOKEN;
-  const client = createClient({ token, apiUrl: env.GITHUB_API_URL || undefined, fetch });
   const event = JSON.parse(readFileSync(env.GITHUB_EVENT_PATH, 'utf8'));
-  const numbers = await prNumbers(client, repo, env.GITHUB_EVENT_NAME, event);
-  if (numbers.length === 0) log('review-policy: no pull request for this event');
-  const results = [];
-  for (const number of numbers) {
-    const input = await gatherInputs(client, repo, number);
-    const result = evaluate(input);
-    await writeCheck(client, repo, input.headSha, result);
-    log(`review-policy: #${number} ${result.pass ? 'PASS' : 'FAIL'}: ${result.reason}`);
+  const auth = await authenticate(env, repo, fetch, log);
+  const client = createClient({ token: auth.token, apiUrl: auth.apiUrl, fetch });
+  // Labels count when this login applied them. It defaults to the App
+  // the token belongs to; github-actions[bot] never counts.
+  const appLogin = String(env.INPUT_APP_LOGIN ?? '').trim() || auth.login;
+  const report = { slug: auth.slug, spoofable: auth.spoofable };
+  const summary = (title, result) => {
     if (env.GITHUB_STEP_SUMMARY) {
-      appendFileSync(env.GITHUB_STEP_SUMMARY, `### #${number}\n\n${summarize(result)}\n\n`);
+      appendFileSync(env.GITHUB_STEP_SUMMARY, `### ${title}\n\n${summarize(result, report)}\n\n`);
     }
-    results.push({ number, ...result });
+  };
+  try {
+    let targets;
+    try {
+      targets = await prTargets(client, repo, env.GITHUB_EVENT_NAME, event);
+    } catch (err) {
+      // Fail closed: a queue entry the check cannot read gets a failing
+      // check rather than none.
+      const sha = event.merge_group?.head_sha;
+      if (err instanceof MergeGroupError && /^[0-9a-f]{40}([0-9a-f]{24})?$/.test(String(sha))) {
+        const result = { pass: false, severity: null, reason: err.message, details: {} };
+        await writeCheck(client, repo, sha, result, report);
+        summary(`merge group ${sha.slice(0, 7)}`, result);
+      }
+      throw err;
+    }
+    if (targets.length === 0) log('review-policy: no pull request for this event');
+    const results = [];
+    for (const { number, reportSha, base } of targets) {
+      const input = await gatherInputs(client, repo, number, { appLogin });
+      let result = evaluate(input);
+      if (base !== undefined && input.baseRef !== base) {
+        result = { ...result, pass: false, reason: `PR #${number} targets ${input.baseRef}, not the merge group's base ${base}` };
+      }
+      if (reportSha) result.details = { ...result.details, mergeGroup: { headSha: reportSha, number } };
+      await writeCheck(client, repo, reportSha ?? input.headSha, result, report);
+      log(`review-policy: #${number} ${result.pass ? 'PASS' : 'FAIL'}: ${result.reason}`);
+      summary(`#${number}`, result);
+      results.push({ number, ...result });
+    }
+    return results;
+  } finally {
+    // An installation token lives an hour; revoke it once done.
+    if (!auth.spoofable) await client.request('DELETE', '/installation/token').catch(() => {});
   }
-  return results;
 }

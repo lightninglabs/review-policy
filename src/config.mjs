@@ -5,6 +5,8 @@ import { globToRegExp } from './glob.mjs';
 
 export const CONFIG_PATH = '.github/review-policy.yml';
 export const SEVERITIES = ['low', 'medium', 'high', 'critical'];
+// Values of a tier's "carry" option.
+export const CARRY_MODES = ['low_only'];
 
 export class ConfigError extends Error {
   constructor(message) {
@@ -68,7 +70,7 @@ export function validateConfig(raw) {
   for (const sev of SEVERITIES) {
     const t = raw.tiers[sev];
     if (!isMap(t)) throw new ConfigError(`tiers.${sev} is required and must be a mapping`);
-    checkKeys(t, ['humans', 'bot', 'fresh'], `tiers.${sev}`);
+    checkKeys(t, ['humans', 'bot', 'fresh', 'carry'], `tiers.${sev}`);
     if (!Number.isInteger(t.humans) || t.humans < 0) {
       throw new ConfigError(`tiers.${sev}.humans must be a non-negative integer`);
     }
@@ -77,7 +79,13 @@ export function validateConfig(raw) {
         throw new ConfigError(`tiers.${sev}.${flag} must be true or false`);
       }
     }
-    tiers[sev] = { humans: t.humans, bot: t.bot === true, fresh: t.fresh === true };
+    if (t.carry !== undefined && !CARRY_MODES.includes(t.carry)) {
+      throw new ConfigError(`tiers.${sev}.carry must be one of: ${CARRY_MODES.join(', ')}`);
+    }
+    if (t.carry !== undefined && t.fresh === true) {
+      throw new ConfigError(`tiers.${sev}: fresh and carry cannot both be set`);
+    }
+    tiers[sev] = { humans: t.humans, bot: t.bot === true, fresh: t.fresh === true, carry: t.carry ?? null };
   }
 
   const experts = {};

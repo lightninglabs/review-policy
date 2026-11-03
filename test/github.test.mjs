@@ -3,10 +3,12 @@ import assert from 'node:assert/strict';
 import { mkdtempSync, writeFileSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { generateKeyPairSync } from 'node:crypto';
 import { createClient } from '../src/github.mjs';
-import { run, gatherInputs } from '../src/main.mjs';
-import { fakeGitHub, API } from './fakegh.mjs';
-import { README_CONFIG, HEAD, OLD, BOT } from './fixtures.mjs';
+import { run, gatherInputs, parseMergeGroupRef, SPOOF_WARNING } from '../src/main.mjs';
+import { appJwt, installationToken, APP_PERMISSIONS } from '../src/app.mjs';
+import { fakeGitHub, checkJwt, API } from './fakegh.mjs';
+import { README_CONFIG, HEAD, OLD, BOT, APP } from './fixtures.mjs';
 
 const REPO = 'lightninglabs/lnd-test';
 
@@ -25,7 +27,7 @@ function prState(over = {}) {
     reviews: over.reviews ?? [],
     timeline: over.timeline ?? [
       { event: 'committed', sha: HEAD },
-      { event: 'labeled', label: { name: 'severity-low' }, actor: { login: 'github-actions[bot]' } },
+      { event: 'labeled', label: { name: 'severity-low' }, actor: { login: APP } },
     ],
   };
 }
@@ -44,6 +46,7 @@ function env(eventName, event, extra = {}) {
     GITHUB_EVENT_NAME: eventName,
     GITHUB_EVENT_PATH: path,
     INPUT_TOKEN: 't0ken',
+    INPUT_APP_LOGIN: APP,
     GITHUB_STEP_SUMMARY: join(dir, 'summary.md'),
     ...extra,
   };
@@ -162,7 +165,7 @@ describe('run', () => {
     reviews[10] = review(11, 'maint1', 'APPROVED');
     reviews[120] = review(121, 'maint2', 'APPROVED');
     reviews[225] = review(226, 'maint1', 'CHANGES_REQUESTED');
-    const pr = prState({ labels: ['severity-medium'], timeline: [{ event: 'labeled', label: { name: 'severity-medium' }, actor: { login: 'github-actions[bot]' } }], reviews });
+    const pr = prState({ labels: ['severity-medium'], timeline: [{ event: 'labeled', label: { name: 'severity-medium' }, actor: { login: APP } }], reviews });
     const gh = world(pr);
     const [r] = await run({ env: env('pull_request_target', { pull_request: { number: 7 } }), fetch: gh.fetch, log: quiet });
     assert.deepEqual(r.details.humanApprovals, ['maint2']);
@@ -180,7 +183,7 @@ describe('run', () => {
   });
 
   test('approvals from non-collaborators do not count', async () => {
-    const pr = prState({ labels: ['severity-medium'], timeline: [{ event: 'labeled', label: { name: 'severity-medium' }, actor: { login: 'github-actions[bot]' } }], reviews: [review(1, 'outsider')] });
+    const pr = prState({ labels: ['severity-medium'], timeline: [{ event: 'labeled', label: { name: 'severity-medium' }, actor: { login: APP } }], reviews: [review(1, 'outsider')] });
     const gh = world(pr);
     const [r] = await run({ env: env('pull_request_target', { pull_request: { number: 7 } }), fetch: gh.fetch, log: quiet });
     assert.equal(r.pass, false);
@@ -228,7 +231,243 @@ describe('run', () => {
   test('gatherInputs looks up permissions only for relevant actors', async () => {
     const gh = world(prState({ reviews: [review(1, BOT), review(2, 'author'), review(3, 'maint1'), review(4, 'maint2', 'COMMENTED')] }));
     const client = createClient({ token: 't0ken', apiUrl: API, fetch: gh.fetch });
-    const input = await gatherInputs(client, REPO, 7);
+    const input = await gatherInputs(client, REPO, 7, { appLogin: APP });
     assert.deepEqual(input.permissions, { maint1: 'write' });
+  });
+});
+
+const { privateKey: KEY, publicKey: PUB } = generateKeyPairSync('rsa', {
+  modulusLength: 2048,
+  privateKeyEncoding: { type: 'pkcs1', format: 'pem' },
+  publicKeyEncoding: { type: 'spki', format: 'pem' },
+});
+const APP_STATE = { id: 4242, slug: 'review-policy', installationId: 99, publicKey: PUB };
+const appEnv = (eventName, event, extra = {}) =>
+  env(eventName, event, { INPUT_APP_ID: '4242', INPUT_PRIVATE_KEY: KEY, INPUT_APP_LOGIN: '', INPUT_TOKEN: '', ...extra });
+
+describe('App authentication', () => {
+  test('appJwt signs an RS256 JWT the API accepts', () => {
+    const jwt = appJwt(4242, KEY);
+    assert.equal(checkJwt(jwt, APP_STATE), null);
+    const [h, p] = jwt.split('.').slice(0, 2).map((x) => JSON.parse(Buffer.from(x, 'base64url').toString()));
+    assert.deepEqual(h, { alg: 'RS256', typ: 'JWT' });
+    assert.equal(p.iss, '4242');
+    assert.equal(p.exp - p.iat, 600);
+    assert.ok(p.iat <= Math.floor(Date.now() / 1000) - 59);
+  });
+
+  test('appJwt accepts a key with literal \\n escapes', () => {
+    assert.equal(checkJwt(appJwt('4242', KEY.replace(/\n/g, '\\n')), APP_STATE), null);
+  });
+
+  test('a JWT from another key or App id is rejected', () => {
+    const other = generateKeyPairSync('rsa', { modulusLength: 2048, privateKeyEncoding: { type: 'pkcs8', format: 'pem' }, publicKeyEncoding: { type: 'spki', format: 'pem' } });
+    assert.equal(checkJwt(appJwt(4242, other.privateKey), APP_STATE), 'bad signature');
+    assert.equal(checkJwt(appJwt(4243, KEY), APP_STATE), 'wrong issuer');
+  });
+
+  test('appJwt rejects bad inputs without echoing the key', () => {
+    assert.throws(() => appJwt('abc', KEY), /numeric/);
+    assert.throws(() => appJwt('', KEY), /numeric/);
+    assert.throws(() => appJwt(1, 'SECRET-NOT-A-KEY'), (e) => /not a PEM private key/.test(e.message) && !e.message.includes('SECRET'));
+    const ec = generateKeyPairSync('ec', { namedCurve: 'P-256', privateKeyEncoding: { type: 'pkcs8', format: 'pem' }, publicKeyEncoding: { type: 'spki', format: 'pem' } });
+    assert.throws(() => appJwt(1, ec.privateKey), /RSA/);
+  });
+
+  test('installationToken mints a repo-scoped token with only the needed permissions', async () => {
+    const gh = world(prState(), { app: { ...APP_STATE } });
+    const t = await installationToken({ appId: '4242', privateKey: KEY, repo: REPO, apiUrl: API, fetch: gh.fetch });
+    assert.deepEqual(t, { token: 'ghs_1', slug: 'review-policy', login: 'review-policy[bot]' });
+    assert.deepEqual(gh.state.tokenRequests, [{ repositories: ['lnd-test'], permissions: APP_PERMISSIONS }]);
+    assert.deepEqual(APP_PERMISSIONS, { checks: 'write', contents: 'read', pull_requests: 'read' });
+  });
+
+  test('installationToken fails when the App is not installed', async () => {
+    const gh = world(prState(), { app: { ...APP_STATE, installed: false } });
+    await assert.rejects(installationToken({ appId: '4242', privateKey: KEY, repo: REPO, apiUrl: API, fetch: gh.fetch }), (e) => e.status === 404);
+  });
+
+  test('run reports as the App, counts its labels, and revokes the token', async () => {
+    const pr = prState({ reviews: [review(1, BOT)], timeline: [{ event: 'labeled', label: { name: 'severity-low' }, actor: { login: 'review-policy[bot]' } }] });
+    const gh = world(pr, { app: { ...APP_STATE } });
+    const logs = [];
+    const e = appEnv('pull_request_target', { pull_request: { number: 7 } });
+    const [r] = await run({ env: e, fetch: gh.fetch, log: (l) => logs.push(l) });
+    assert.equal(r.pass, true, r.reason);
+    assert.equal(gh.state.checkRuns.length, 1);
+    assert.equal(gh.state.checkRuns[0].app.slug, 'review-policy');
+    assert.ok(gh.writes.every((w) => w.slug === 'review-policy'));
+    assert.ok(!gh.state.checkRuns[0].output.summary.includes('spoofed'));
+    assert.ok(!readFileSync(e.GITHUB_STEP_SUMMARY, 'utf8').includes('spoofed'));
+    assert.ok(logs.includes('::add-mask::ghs_1'));
+    assert.deepEqual([...gh.revoked], ['ghs_1']);
+  });
+
+  test('the App updates its own check run, not one from GitHub Actions', async () => {
+    const gh = world(prState({ reviews: [review(1, BOT)] }), { app: { ...APP_STATE } });
+    gh.state.checkRuns = [{ id: 1, name: 'review-policy', head_sha: HEAD, app: { slug: 'github-actions' }, conclusion: 'success' }];
+    const e = appEnv('pull_request_target', { pull_request: { number: 7 } }, { INPUT_APP_LOGIN: APP });
+    await run({ env: e, fetch: gh.fetch, log: quiet });
+    await run({ env: e, fetch: gh.fetch, log: quiet });
+    assert.deepEqual(gh.state.checkRuns.map((c) => c.app.slug), ['github-actions', 'review-policy']);
+    assert.deepEqual(gh.writes.map((w) => w.method), ['POST', 'PATCH']);
+  });
+
+  test('app_login overrides the default App login', async () => {
+    const gh = world(prState({ reviews: [review(1, BOT)] }), { app: { ...APP_STATE } });
+    const [r] = await run({ env: appEnv('pull_request_target', { pull_request: { number: 7 } }, { INPUT_APP_LOGIN: 'classifier-app[bot]' }), fetch: gh.fetch, log: quiet });
+    assert.match(r.reason, /^needs severity/);
+  });
+
+  test('a wrong private key fails before anything is written', async () => {
+    const other = generateKeyPairSync('rsa', { modulusLength: 2048, privateKeyEncoding: { type: 'pkcs1', format: 'pem' }, publicKeyEncoding: { type: 'spki', format: 'pem' } });
+    const gh = world(prState(), { app: { ...APP_STATE } });
+    await assert.rejects(run({ env: appEnv('pull_request_target', { pull_request: { number: 7 } }, { INPUT_PRIVATE_KEY: other.privateKey }), fetch: gh.fetch, log: quiet }), (e) => e.status === 401);
+    assert.equal(gh.writes.length, 0);
+  });
+
+  test('app_id without private_key fails instead of falling back', async () => {
+    const gh = world(prState(), { app: { ...APP_STATE } });
+    await assert.rejects(run({ env: appEnv('pull_request_target', { pull_request: { number: 7 } }, { INPUT_PRIVATE_KEY: '', INPUT_TOKEN: 't0ken' }), fetch: gh.fetch, log: quiet }), /private_key is empty/);
+    await assert.rejects(run({ env: appEnv('pull_request_target', { pull_request: { number: 7 } }, { INPUT_APP_ID: '', INPUT_TOKEN: 't0ken' }), fetch: gh.fetch, log: quiet }), /app_id is empty/);
+    assert.equal(gh.writes.length, 0);
+  });
+
+  test('without the App, GITHUB_TOKEN reports with a loud spoofing warning', async () => {
+    const gh = world(prState({ reviews: [review(1, BOT)] }));
+    const logs = [];
+    const e = env('pull_request_target', { pull_request: { number: 7 } });
+    await run({ env: e, fetch: gh.fetch, log: (l) => logs.push(l) });
+    assert.ok(gh.state.checkRuns[0].output.summary.startsWith(SPOOF_WARNING));
+    assert.ok(readFileSync(e.GITHUB_STEP_SUMMARY, 'utf8').includes(SPOOF_WARNING));
+    assert.ok(logs.some((l) => l.startsWith('::warning::') && /spoofed/.test(l)));
+  });
+
+  test('without the App, github-actions[bot] labels still do not count', async () => {
+    const pr = prState({ reviews: [review(1, BOT)], timeline: [{ event: 'labeled', label: { name: 'severity-low' }, actor: { login: 'github-actions[bot]' } }] });
+    const gh = world(pr);
+    const [r] = await run({ env: env('pull_request_target', { pull_request: { number: 7 } }, { INPUT_APP_LOGIN: '' }), fetch: gh.fetch, log: quiet });
+    assert.equal(r.pass, false);
+    assert.match(r.reason, /^needs severity.*github-actions\[bot\], which any workflow can act as/);
+  });
+});
+
+const GROUP_SHA = 'e'.repeat(40);
+const groupRef = (n = 7, base = 'master') => `refs/heads/gh-readonly-queue/${base}/pr-${n}-${'a'.repeat(40)}`;
+const groupEvent = (over = {}) => ({ merge_group: { head_sha: GROUP_SHA, head_ref: groupRef(), base_sha: 'f'.repeat(40), base_ref: 'refs/heads/master', ...over } });
+
+describe('merge_group', () => {
+  test('parses queue refs', () => {
+    assert.deepEqual(parseMergeGroupRef(groupRef(7)), { base: 'master', number: 7, sha: 'a'.repeat(40) });
+    assert.deepEqual(parseMergeGroupRef(groupRef(10424, 'release/v0.19')), { base: 'release/v0.19', number: 10424, sha: 'a'.repeat(40) });
+    assert.equal(parseMergeGroupRef(`refs/heads/gh-readonly-queue/main/pr-3-${'b'.repeat(64)}`).number, 3);
+  });
+
+  for (const bad of [
+    undefined,
+    '',
+    'gh-readonly-queue/master/pr-7-' + 'a'.repeat(40),
+    'refs/heads/master',
+    'refs/heads/gh-readonly-queue/master/pr-7',
+    'refs/heads/gh-readonly-queue/master/pr--7-' + 'a'.repeat(40),
+    'refs/heads/gh-readonly-queue/master/pr-0-' + 'a'.repeat(40),
+    'refs/heads/gh-readonly-queue/master/pr-07-' + 'a'.repeat(40),
+    'refs/heads/gh-readonly-queue/master/pr-x-' + 'a'.repeat(40),
+    'refs/heads/gh-readonly-queue/master/pr-7-' + 'a'.repeat(39),
+    'refs/heads/gh-readonly-queue/master/pr-7-' + 'A'.repeat(40),
+    'refs/heads/gh-readonly-queue/master/pr-7-' + 'a'.repeat(40) + '/x',
+    'refs/heads/gh-readonly-queue//pr-7-' + 'a'.repeat(40),
+    'refs/heads/gh-readonly-queue/pr-7-' + 'a'.repeat(40),
+    'refs/heads/gh-readonly-queue/master/pr-99999999999999999999-' + 'a'.repeat(40),
+  ]) {
+    test(`rejects ${JSON.stringify(bad)}`, () => assert.equal(parseMergeGroupRef(bad), null));
+  }
+
+  test('evaluates the PR on its head and reports on the merge group head', async () => {
+    const gh = world(prState({ reviews: [review(1, BOT)] }), { app: { ...APP_STATE } });
+    const e = appEnv('merge_group', groupEvent(), { INPUT_APP_LOGIN: APP });
+    const [r] = await run({ env: e, fetch: gh.fetch, log: quiet });
+    assert.equal(r.number, 7);
+    assert.equal(r.pass, true, r.reason);
+    assert.equal(r.details.headSha, HEAD);
+    assert.equal(gh.state.checkRuns.length, 1);
+    const c = gh.state.checkRuns[0];
+    assert.equal(c.head_sha, GROUP_SHA);
+    assert.equal(c.conclusion, 'success');
+    assert.equal(c.app.slug, 'review-policy');
+    assert.match(c.output.summary, /Merge group \| `e{40}`, evaluated as PR #7/);
+    assert.ok(!gh.calls.some((cl) => cl.includes(`/commits/${HEAD}/check-runs`)));
+  });
+
+  test('a PR that no longer meets the policy fails the queue entry', async () => {
+    const gh = world(prState({ reviews: [review(1, BOT, 'APPROVED', 'b'.repeat(40))] }));
+    const [r] = await run({ env: env('merge_group', groupEvent()), fetch: gh.fetch, log: quiet });
+    assert.equal(r.pass, false);
+    assert.equal(gh.state.checkRuns[0].head_sha, GROUP_SHA);
+    assert.equal(gh.state.checkRuns[0].conclusion, 'failure');
+  });
+
+  for (const [name, over] of [
+    ['an unparsable ref', { head_ref: 'refs/heads/some-branch' }],
+    ['a missing ref', { head_ref: undefined }],
+    ['a ref whose base does not match base_ref', { base_ref: 'refs/heads/main' }],
+  ]) {
+    test(`${name} fails closed on the group head`, async () => {
+      const gh = world(prState({ reviews: [review(1, BOT)] }));
+      await assert.rejects(run({ env: env('merge_group', groupEvent(over)), fetch: gh.fetch, log: quiet }), /merge group/);
+      assert.equal(gh.state.checkRuns.length, 1);
+      assert.equal(gh.state.checkRuns[0].head_sha, GROUP_SHA);
+      assert.equal(gh.state.checkRuns[0].conclusion, 'failure');
+      assert.ok(!gh.calls.some((c) => c.includes('/pulls/7')));
+    });
+  }
+
+  test('no head_sha: nothing to report on, and the run fails', async () => {
+    const gh = world();
+    await assert.rejects(run({ env: env('merge_group', groupEvent({ head_sha: undefined })), fetch: gh.fetch, log: quiet }), /no head_sha/);
+    assert.equal(gh.writes.length, 0);
+  });
+
+  test('a PR that targets another branch than the queue fails', async () => {
+    const gh = world();
+    gh.state.prs[7].pull.base.ref = 'other';
+    gh.state.config.other = README_CONFIG;
+    const [r] = await run({ env: env('merge_group', groupEvent()), fetch: gh.fetch, log: quiet });
+    assert.equal(r.pass, false);
+    assert.match(r.reason, /targets other, not the merge group's base master/);
+  });
+});
+
+describe('carry: low_only through the compare API', () => {
+  const APPROVED = 'b'.repeat(40);
+  const medium = (reviews) => prState({ labels: ['severity-medium'], timeline: [{ event: 'labeled', label: { name: 'severity-medium' }, actor: { login: APP } }], reviews });
+
+  test('carries an approval when only low-risk files changed since', async () => {
+    const gh = world(medium([review(1, 'maint1', 'APPROVED', APPROVED)]), { compare: { [APPROVED]: { files: ['docs/a.md'] } } });
+    const [r] = await run({ env: env('pull_request_target', { pull_request: { number: 7 } }), fetch: gh.fetch, log: quiet });
+    assert.ok(gh.calls.some((c) => c === `GET /repos/${REPO}/compare/${APPROVED}...${HEAD}`));
+    assert.equal(r.pass, true, r.reason);
+    assert.match(gh.state.checkRuns[0].output.summary, /Carried from older commits \| maint1/);
+  });
+
+  for (const [what, compare] of [
+    ['a floored file', { [APPROVED]: { files: ['docs/a.md', 'routing/r.go'] } }],
+    ['a never-auto-approve file', { [APPROVED]: { files: ['scripts/x.sh'] } }],
+    ['the policy file', { [APPROVED]: { files: ['.github/review-policy.yml'] } }],
+    ['a force-push', { [APPROVED]: { status: 'diverged', files: ['docs/a.md'] } }],
+    ['300 or more files', { [APPROVED]: { files: Array.from({ length: 300 }, (_, i) => `docs/${i}.md`) } }],
+    ['an unknown commit', {}],
+  ]) {
+    test(`does not carry past ${what}`, async () => {
+      const gh = world(medium([review(1, 'maint1', 'APPROVED', APPROVED)]), { compare });
+      const [r] = await run({ env: env('pull_request_target', { pull_request: { number: 7 } }), fetch: gh.fetch, log: quiet });
+      assert.equal(r.pass, false);
+    });
+  }
+
+  test('does not call the compare API for approvals on the head', async () => {
+    const gh = world(medium([review(1, 'maint1')]));
+    await run({ env: env('pull_request_target', { pull_request: { number: 7 } }), fetch: gh.fetch, log: quiet });
+    assert.ok(!gh.calls.some((c) => c.includes('/compare/')));
   });
 });

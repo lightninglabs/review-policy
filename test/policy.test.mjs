@@ -1,8 +1,8 @@
 import { test, describe } from 'node:test';
 import assert from 'node:assert/strict';
-import { evaluate, actorsToCheck } from '../src/policy.mjs';
+import { evaluate, actorsToCheck, staleApprovalCommits } from '../src/policy.mjs';
 import { parseConfig } from '../src/config.mjs';
-import { config, input, approve, HEAD, OLD, BOT, README_CONFIG } from './fixtures.mjs';
+import { config, input, approve, HEAD, OLD, BOT, APP, README_CONFIG } from './fixtures.mjs';
 
 const lab = (label, actor, event = 'labeled') => ({ event, label, actor });
 
@@ -45,9 +45,43 @@ describe('fail closed', () => {
 });
 
 describe('rule: severity label', () => {
-  test('applied by the classifier counts', () => {
+  test('applied by the review-policy App counts', () => {
     const r = evaluate(input({ severity: 'medium', reviews: [approve('maint1')] }));
     assert.equal(r.severity, 'medium');
+    assert.equal(r.pass, true);
+  });
+
+  test('applied by github-actions[bot] is ignored', () => {
+    const r = evaluate(input({ severity: null, labels: ['severity-low'], timeline: [lab('severity-low', 'github-actions[bot]')], reviews: [approve(BOT)] }));
+    assert.equal(r.pass, false);
+    assert.match(r.reason, /^needs severity.*severity-low applied by github-actions\[bot\], which any workflow can act as/);
+  });
+
+  test('github-actions[bot] is ignored even when configured as the App login', () => {
+    const r = evaluate(input({ appLogin: 'github-actions[bot]', severity: null, labels: ['severity-low'], timeline: [lab('severity-low', 'github-actions[bot]')], reviews: [approve(BOT)] }));
+    assert.match(r.reason, /^needs severity/);
+  });
+
+  test('a github-actions[bot] label cannot raise or lower a counted one', () => {
+    const r = evaluate(input({
+      severity: null,
+      labels: ['severity-critical', 'severity-low'],
+      timeline: [lab('severity-critical', 'github-actions[bot]'), lab('severity-low', APP)],
+      reviews: [approve(BOT)],
+    }));
+    assert.equal(r.severity, 'low');
+    assert.equal(r.pass, true);
+  });
+
+  test('an App login label counts only for the configured App', () => {
+    const other = evaluate(input({ appLogin: 'other-app[bot]', reviews: [approve(BOT)] }));
+    assert.match(other.reason, /^needs severity.*review-policy\[bot\], who lacks write access/);
+    const none = evaluate(input({ appLogin: null, reviews: [approve(BOT)] }));
+    assert.match(none.reason, /^needs severity/);
+  });
+
+  test('App login matching is case-insensitive', () => {
+    const r = evaluate(input({ appLogin: 'Review-Policy[bot]', reviews: [approve(BOT)] }));
     assert.equal(r.pass, true);
   });
 
@@ -67,7 +101,7 @@ describe('rule: severity label', () => {
     const r = evaluate(input({
       severity: null,
       labels: ['severity-high', 'severity-low'],
-      timeline: [lab('severity-high', 'github-actions[bot]'), lab('severity-low', 'author')],
+      timeline: [lab('severity-high', APP), lab('severity-low', 'author')],
       reviews: [approve(BOT)],
     }));
     assert.equal(r.severity, 'high');
@@ -121,7 +155,7 @@ describe('rule: severity label', () => {
     const r = evaluate(input({
       severity: null,
       labels: ['severity-low', 'severity-critical'],
-      timeline: [lab('severity-low', 'github-actions[bot]'), lab('severity-critical', 'maint1')],
+      timeline: [lab('severity-low', APP), lab('severity-critical', 'maint1')],
     }));
     assert.equal(r.severity, 'critical');
   });
@@ -241,14 +275,69 @@ describe('rule: approvals', () => {
 });
 
 describe('rule: fresh vs carried approvals', () => {
-  test('MEDIUM (not fresh): an approval on an older commit carries', () => {
-    const r = evaluate(input({ severity: 'medium', reviews: [approve('maint1', OLD)] }));
+  const since = (files, status = 'ahead', complete = true) => ({ [OLD]: { status, files, complete } });
+
+  test('MEDIUM (carry: low_only): an approval carries past low-risk changes', () => {
+    const r = evaluate(input({ severity: 'medium', reviews: [approve('maint1', OLD)], changesSince: since(['docs/x.md', 'lnrpc/a.go']) }));
+    assert.equal(r.pass, true);
+    assert.deepEqual(r.details.carriedApprovals, ['maint1']);
+  });
+
+  for (const [what, file, why] of [
+    ['a floored path', 'htlcswitch/switch.go', /htlcswitch\/switch.go changed since/],
+    ['a CRITICAL-floored path', 'channeldb/migration33/m.go', /migration33\/m.go changed since/],
+    ['a never-auto-approve path', 'go.mod', /go.mod changed since/],
+    ['a nested never-auto-approve path', 'lnrpc/AGENTS.md', /AGENTS.md changed since/],
+    ['the policy file', '.github/review-policy.yml', /review-policy.yml changed since/],
+  ]) {
+    test(`MEDIUM (carry: low_only): ${what} changed since blocks the carry`, () => {
+      const r = evaluate(input({ severity: 'medium', reviews: [approve('maint1', OLD)], changesSince: since(['docs/x.md', file]) }));
+      assert.equal(r.pass, false);
+      assert.match(r.details.ignoredApprovals[0].why, why);
+    });
+  }
+
+  test('MEDIUM (carry: low_only): a rename out of a floored path blocks the carry', () => {
+    const r = evaluate(input({ severity: 'medium', reviews: [approve('maint1', OLD)], changesSince: since([{ filename: 'misc/w.go', previous_filename: 'lnwallet/w.go' }]) }));
+    assert.equal(r.pass, false);
+  });
+
+  test('MEDIUM (carry: low_only): no comparison, a non-descendant head, or a truncated list blocks the carry', () => {
+    for (const [changesSince, why] of [
+      [undefined, /cannot be compared/],
+      [{ [OLD]: null }, /cannot be compared/],
+      [since(['docs/x.md'], 'diverged'), /does not descend/],
+      [since(['docs/x.md'], 'behind'), /does not descend/],
+      [since(['docs/x.md'], 'ahead', false), /too many files/],
+    ]) {
+      const r = evaluate(input({ severity: 'medium', reviews: [approve('maint1', OLD)], changesSince }));
+      assert.equal(r.pass, false);
+      assert.match(r.details.ignoredApprovals[0].why, why);
+    }
+  });
+
+  test('MEDIUM (carry: low_only): an approval on the head needs no comparison', () => {
+    const r = evaluate(input({ severity: 'medium', reviews: [approve('maint1')] }));
+    assert.equal(r.pass, true);
+    assert.deepEqual(r.details.carriedApprovals, []);
+  });
+
+  test('a tier with neither fresh nor carry keeps older human approvals', () => {
+    const r = evaluate(input({ files: ['go.mod'], reviews: [approve('maint1', OLD)] }));
     assert.equal(r.pass, true);
   });
 
-  test('LOW (not fresh): a bot approval on an older commit carries', () => {
+  test('LOW: a bot approval on an older commit does not count', () => {
     const r = evaluate(input({ reviews: [approve(BOT, OLD)] }));
-    assert.equal(r.pass, true);
+    assert.equal(r.pass, false);
+    assert.deepEqual(r.details.botApprovals, []);
+    assert.match(r.details.ignoredApprovals[0].why, /^bot approved 0ld0000, not the head$/);
+  });
+
+  test('a bot approval on an older commit never carries, even past low-risk changes', () => {
+    const cfg = { ...config, tiers: { ...config.tiers, medium: { humans: 1, bot: true, fresh: false, carry: 'low_only' } } };
+    const r = evaluate(input({ config: cfg, severity: 'medium', reviews: [approve('maint1'), approve(BOT, OLD)], changesSince: since(['docs/x.md']) }));
+    assert.equal(r.pass, false);
   });
 
   test('HIGH (fresh): an approval on an older commit does not count', () => {
@@ -370,6 +459,62 @@ describe('rule: experts', () => {
   test('expert author: one human is enough even for CRITICAL label', () => {
     const v = evaluate(alice({ severity: 'critical', files: ['htlcswitch/a.go'], reviews: [approve('maint1')] }));
     assert.equal(v.pass, true);
+    assert.equal(v.reason, 'CRITICAL (expert author alice): 1 of 1 human approval on abc1234');
+  });
+
+  test('expert at CRITICAL needs exactly one human: the bot is not enough', () => {
+    const cfg = parseConfig(README_CONFIG.replace('alice: ["htlcswitch/**", "routing/**"]', 'alice: ["lnwallet/**"]'));
+    const at = (reviews) => evaluate(alice({ config: cfg, severity: 'low', files: ['lnwallet/a.go'], reviews }));
+    assert.equal(at([]).pass, false);
+    const botOnly = at([approve(BOT)]);
+    assert.equal(botOnly.details.expert, true);
+    assert.equal(botOnly.severity, 'critical');
+    assert.deepEqual(botOnly.details.requirement, { humans: 1, total: 1, fresh: true, carry: null });
+    assert.equal(botOnly.pass, false);
+    assert.equal(botOnly.reason, 'CRITICAL (expert author alice): 0 of 1 human approval on abc1234');
+    assert.equal(at([approve('maint1')]).pass, true);
+    assert.equal(at([approve('maint1', OLD)]).pass, false);
+  });
+
+  test('expert at CRITICAL keeps one human even when the tier allows the bot', () => {
+    const cfg = parseConfig(README_CONFIG
+      .replace('critical: { humans: 2, fresh: true }', 'critical: { humans: 1, bot: true, fresh: true }')
+      .replace('alice: ["htlcswitch/**", "routing/**"]', 'alice: ["lnwallet/**"]'));
+    const at = (reviews) => evaluate(alice({ config: cfg, severity: 'critical', files: ['lnwallet/a.go'], reviews }));
+    const botOnly = at([approve(BOT)]);
+    assert.equal(botOnly.details.expert, true);
+    assert.deepEqual(botOnly.details.requirement, { humans: 1, total: 1, fresh: true, carry: null });
+    assert.equal(botOnly.pass, false);
+    assert.equal(at([approve('maint1')]).pass, true);
+    // Without the expert rule the same tier needs a human and the bot.
+    assert.equal(evaluate(input({ config: cfg, severity: 'critical', files: ['lnwallet/a.go'], reviews: [approve('maint1')] })).pass, false);
+  });
+
+  test('expert at MEDIUM: the bot on the head is enough', () => {
+    const cfg = parseConfig(README_CONFIG
+      .replace('high: ["htlcswitch/**"', 'medium: ["lnrpc/**"]\n  high: ["htlcswitch/**"')
+      .replace('alice: ["htlcswitch/**", "routing/**"]', 'alice: ["lnrpc/**"]'));
+    const at = (reviews) => evaluate(alice({ config: cfg, severity: 'low', files: ['lnrpc/a.go'], reviews }));
+    const v = at([approve(BOT)]);
+    assert.equal(v.severity, 'medium');
+    assert.equal(v.details.expert, true);
+    assert.equal(v.pass, true);
+    assert.equal(v.reason, 'MEDIUM (expert author alice): bot approval (head abc1234)');
+    assert.equal(at([approve(BOT, OLD)]).pass, false);
+    assert.equal(at([]).pass, false);
+  });
+
+  test('expert at HIGH needs one approval in all, not zero', () => {
+    const v = evaluate(alice({ files: ['htlcswitch/a.go'], reviews: [] }));
+    assert.deepEqual(v.details.requirement, { humans: 0, total: 1, fresh: true, carry: null });
+    assert.equal(v.pass, false);
+  });
+
+  test('expert relief is exactly one approval below the tier', () => {
+    const cfg = parseConfig(README_CONFIG.replace('critical: { humans: 2, fresh: true }', 'critical: { humans: 3, fresh: true }'));
+    const v = evaluate(alice({ config: cfg, severity: 'critical', files: ['htlcswitch/a.go'], reviews: [approve('maint1')] }));
+    assert.deepEqual(v.details.requirement, { humans: 2, total: 2, fresh: true, carry: null });
+    assert.equal(v.pass, false);
   });
 
   test('expert rule keeps the tier freshness', () => {
@@ -421,13 +566,22 @@ describe('rule: experts', () => {
 });
 
 describe('actorsToCheck', () => {
-  test('lists non-bot labelers and approvers, not the author or classifier', () => {
+  test('lists non-bot labelers and approvers, not the author, the App, or github-actions', () => {
     const got = actorsToCheck(input({
-      labels: ['severity-low', 'severity-high'],
-      timeline: [lab('severity-low', 'github-actions[bot]'), lab('severity-high', 'Maint1')],
+      labels: ['severity-low', 'severity-high', 'severity-medium'],
+      timeline: [lab('severity-low', APP), lab('severity-high', 'Maint1'), lab('severity-medium', 'github-actions[bot]')],
       reviews: [approve('maint2'), approve(BOT), approve('author'), approve('x', HEAD, 'CHANGES_REQUESTED')],
     }));
     assert.deepEqual(got, ['maint1', 'maint2']);
+  });
+});
+
+describe('staleApprovalCommits', () => {
+  test('lists older commits of human approvals only', () => {
+    const got = staleApprovalCommits(input({
+      reviews: [approve('maint1', OLD), approve('maint2'), approve(BOT, 'b'.repeat(40)), approve('author', 'c'.repeat(40)), approve('maint3', 'd'.repeat(40), 'CHANGES_REQUESTED')],
+    }));
+    assert.deepEqual(got, [OLD]);
   });
 });
 

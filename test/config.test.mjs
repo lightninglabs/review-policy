@@ -6,10 +6,10 @@ import { README_CONFIG } from './fixtures.mjs';
 test('README example validates and normalizes', () => {
   const c = parseConfig(README_CONFIG);
   assert.deepEqual(c.tiers, {
-    low: { humans: 0, bot: true, fresh: false },
-    medium: { humans: 1, bot: false, fresh: false },
-    high: { humans: 1, bot: false, fresh: true },
-    critical: { humans: 2, bot: false, fresh: true },
+    low: { humans: 0, bot: true, fresh: false, carry: null },
+    medium: { humans: 1, bot: false, fresh: false, carry: 'low_only' },
+    high: { humans: 1, bot: false, fresh: true, carry: null },
+    critical: { humans: 2, bot: false, fresh: true, carry: null },
   });
   assert.deepEqual(c.floor.low, []);
   assert.deepEqual(c.experts.alice, ['htlcswitch/**', 'routing/**']);
@@ -38,6 +38,8 @@ for (const [name, src, re] of [
   ['bad glob', `version: 1\nfloor:\n  high: ["a**/b"]\n${tiers}`, /whole path segment/],
   ['empty expert', `version: 1\nexperts:\n  bob: []\n${tiers}`, /at least one glob/],
   ['bad YAML', 'version: 1\n  x: 2', /cannot parse YAML/],
+  ['unknown carry mode', 'version: 1\ntiers:\n  low: {humans: 0}\n  medium: {humans: 1, carry: always}\n  high: {humans: 1}\n  critical: {humans: 2}\n', /carry must be one of: low_only/],
+  ['carry with fresh', 'version: 1\ntiers:\n  low: {humans: 0}\n  medium: {humans: 1, carry: low_only, fresh: true}\n  high: {humans: 1}\n  critical: {humans: 2}\n', /fresh and carry cannot both be set/],
 ]) {
   test(`rejects ${name}`, () => assert.throws(() => parseConfig(src), re));
 }

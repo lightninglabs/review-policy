@@ -5,7 +5,7 @@
 
 import { readFileSync, writeFileSync } from 'node:fs';
 
-const ORDER = ['yaml', 'glob', 'config', 'policy', 'github', 'main', 'cli'];
+const ORDER = ['yaml', 'glob', 'config', 'policy', 'github', 'app', 'main', 'cli'];
 const root = new URL('../', import.meta.url);
 const nodeImports = new Map();
 const bodies = [];

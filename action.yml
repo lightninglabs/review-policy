@@ -1,8 +1,26 @@
 name: review-policy
 description: Require approvals that match a pull request's risk, as a check run named review-policy.
 inputs:
+  app_id:
+    description: >-
+      The review-policy GitHub App's id. With private_key, the check is
+      reported as the App, which the ruleset can require. Without them it
+      falls back to token and warns that the check can be spoofed.
+    required: false
+  private_key:
+    description: >-
+      The App's private key (PEM). Keep it in an environment that only the
+      default branch can deploy to.
+    required: false
+  app_login:
+    description: >-
+      The login whose severity labels count besides maintainers'. Defaults
+      to the bot login of the App that app_id names.
+    required: false
   token:
-    description: Token with checks:write, contents:read, and pull-requests:read.
+    description: >-
+      Fallback token when app_id and private_key are not set. Needs
+      checks:write, contents:read, and pull-requests:read.
     default: ${{ github.token }}
 runs:
   using: node24

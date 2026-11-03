@@ -6,7 +6,7 @@ import { README_CONFIG } from './fixtures.mjs';
 test('parses the README example', () => {
   const y = parseYaml(README_CONFIG);
   assert.equal(y.version, 1);
-  assert.deepEqual(y.bots, ['lightninglabs-gateway[bot]']);
+  assert.deepEqual(y.bots, ['ll-review-bot']);
   assert.deepEqual(y.floor.high, ['htlcswitch/**', 'routing/**', 'peer/**']);
   assert.deepEqual(y.never_auto_approve.slice(-2), ['**/AGENTS.md', '**/CLAUDE.md']);
   assert.deepEqual(y.tiers.high, { humans: 1, fresh: true });

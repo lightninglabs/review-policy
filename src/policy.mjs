@@ -4,8 +4,9 @@
 import { CONFIG_PATH, SEVERITIES } from './config.mjs';
 import { matchAny } from './glob.mjs';
 
-// The account the severity classifier workflow applies labels as.
-export const CLASSIFIER = 'github-actions[bot]';
+// The account every workflow's GITHUB_TOKEN acts as. Anything it does
+// could come from any workflow, so its labels never count.
+export const ACTIONS_BOT = 'github-actions[bot]';
 
 const LABEL_RE = /^severity-(low|medium|high|critical)$/;
 const WRITE_PERMISSIONS = new Set(['admin', 'maintain', 'write']);
@@ -68,21 +69,64 @@ function latestReviews(reviews) {
   return [...latest.values()];
 }
 
+// floorOf returns the path floor for one path, or null. The policy file
+// is always CRITICAL.
+function floorOf(config, path) {
+  let pf = path === CONFIG_PATH ? 'critical' : null;
+  for (const sev of SEVERITIES) {
+    if (matchAny(config.floor[sev], path)) pf = maxSeverity(pf, sev);
+  }
+  return pf;
+}
+
 // actorsToCheck lists the logins whose repository permission the
 // evaluation needs: severity labelers and approving reviewers that are
 // not bots.
 export function actorsToCheck(input) {
   const { config, labels, timeline, reviews, author } = input;
   const bots = new Set((config?.bots ?? []).map(lc));
+  const skip = new Set([ACTIONS_BOT, lc(author), lc(input.appLogin)]);
   const out = new Set();
   for (const { actor } of latestLabelers(labels, timeline)) {
-    if (actor && lc(actor) !== CLASSIFIER && lc(actor) !== lc(author)) out.add(lc(actor));
+    if (actor && !skip.has(lc(actor))) out.add(lc(actor));
   }
   for (const r of latestReviews(reviews)) {
     const who = lc(r.user);
     if (r.state === 'APPROVED' && !bots.has(who) && who !== lc(author)) out.add(who);
   }
   return [...out].sort();
+}
+
+// staleApprovalCommits lists the commits that human approvals were given
+// on, other than the head. For tiers with "carry", the evaluation needs
+// the files changed between each of them and the head.
+export function staleApprovalCommits(input) {
+  const { config, reviews, author, headSha } = input;
+  const bots = new Set((config?.bots ?? []).map(lc));
+  const out = new Set();
+  for (const r of latestReviews(reviews)) {
+    const who = lc(r.user);
+    if (r.state !== 'APPROVED' || bots.has(who) || who === lc(author)) continue;
+    if (r.commitId && r.commitId !== headSha) out.add(r.commitId);
+  }
+  return [...out].sort();
+}
+
+// carryBlocker says why a human approval on an older commit cannot carry
+// to the head under "carry: low_only", or returns null if it can. It
+// carries only if the head descends from the approved commit and every
+// file changed since is outside the floor and never_auto_approve.
+function carryBlocker(config, since, sha) {
+  const at = `approved ${short(sha)}`;
+  if (!since) return `${at}, which cannot be compared with the head`;
+  if (since.status !== 'ahead' && since.status !== 'identical') {
+    return `${at}, which the head does not descend from`;
+  }
+  if (!since.complete) return `${at}; too many files changed since to check`;
+  const hit = changedPaths(since.files).find(
+    (p) => floorOf(config, p) || matchAny(config.neverAutoApprove, p),
+  );
+  return hit ? `${at}; ${hit} changed since` : null;
 }
 
 function fail(reason, details = {}, severity = null) {
@@ -101,6 +145,9 @@ function fail(reason, details = {}, severity = null) {
 //   author       PR author login
 //   headSha      the PR's current head commit
 //   permissions  login (lower case) -> repository permission
+//   appLogin     the review-policy App's bot login, whose labels count
+//   changesSince approved commit -> {status, files, complete}: the
+//                comparison of that commit with the head, for "carry"
 //
 // Returns {pass, severity, reason, details}.
 export function evaluate(input) {
@@ -119,14 +166,16 @@ export function evaluate(input) {
   const paths = changedPaths(input.files);
   const details = { headSha, author, paths: paths.length };
 
-  // Severity from labels. A label counts only if the classifier or a
-  // maintainer other than the author applied it most recently.
+  // Severity from labels. A label counts only if the review-policy App or
+  // a maintainer other than the author applied it most recently.
+  const appLc = lc(input.appLogin);
   const labelInfo = latestLabelers(input.labels, input.timeline).map(({ label, actor }) => {
     const sev = LABEL_RE.exec(label)[1];
     let why = null;
     if (!actor) why = 'no labeled event in the timeline';
-    else if (lc(actor) === CLASSIFIER) why = null;
+    else if (lc(actor) === ACTIONS_BOT) why = `applied by ${ACTIONS_BOT}, which any workflow can act as`;
     else if (lc(actor) === authorLc) why = 'applied by the PR author';
+    else if (appLc && lc(actor) === appLc) why = null;
     else if (!hasWrite(permissions, actor)) why = `applied by ${actor}, who lacks write access`;
     return { label, severity: sev, actor, counted: why === null, why };
   });
@@ -140,10 +189,7 @@ export function evaluate(input) {
   let floorSeverity = null;
   const floored = [];
   for (const p of paths) {
-    let pf = p === CONFIG_PATH ? 'critical' : null;
-    for (const sev of SEVERITIES) {
-      if (matchAny(config.floor[sev], p)) pf = maxSeverity(pf, sev);
-    }
+    const pf = floorOf(config, p);
     if (pf) {
       floored.push(p);
       floorSeverity = maxSeverity(floorSeverity, pf);
@@ -158,7 +204,7 @@ export function evaluate(input) {
     const note = ignored.length
       ? ` (ignored: ${ignored.map((l) => `${l.label} ${l.why}`).join('; ')})`
       : '';
-    return fail(`needs severity: no severity-* label applied by the classifier or a maintainer${note}`, details);
+    return fail(`needs severity: no severity-* label applied by a maintainer or the review-policy App${note}`, details);
   }
   const severity = maxSeverity(labelSeverity, floorSeverity);
   const SEV = severity.toUpperCase();
@@ -175,48 +221,71 @@ export function evaluate(input) {
     !!expertGlobs && !configEdited && floored.length > 0 && floored.every((p) => matchAny(expertGlobs, p));
   details.expert = expert;
 
+  // The requirement: at least `humans` human approvals, and `total`
+  // approvals of which one may be the bot's. An expert needs one approval
+  // fewer, but never none (the ruleset still wants one) and never fewer
+  // than one human at CRITICAL.
   const tier = config.tiers[severity];
   const fresh = tier.fresh;
-  const need = expert ? { humans: 0, bot: true } : { humans: tier.humans, bot: tier.bot };
-  details.requirement = { ...need, fresh };
+  let needHumans = tier.humans;
+  let needTotal = tier.humans + (tier.bot ? 1 : 0);
+  if (expert) {
+    needHumans = Math.max(needHumans - 1, severity === 'critical' ? 1 : 0);
+    needTotal = Math.max(needTotal - 1, needHumans, Math.min(needTotal, 1));
+  }
+  details.requirement = { humans: needHumans, total: needTotal, fresh, carry: tier.carry };
 
-  // Approvals.
+  // Approvals. A bot's counts only on the head, in every tier. A human's
+  // on an older commit follows the tier: never for fresh, only past
+  // low-risk changes for carry: low_only, otherwise always.
   const humans = [];
+  const carried = [];
   const botApprovals = [];
   const ignored = [];
   for (const r of latestReviews(input.reviews)) {
     if (r.state !== 'APPROVED') continue;
     const who = r.user;
     const whoLc = lc(who);
+    const onHead = r.commitId === headSha;
     if (whoLc === authorLc) ignored.push({ login: who, why: 'PR author' });
-    else if (fresh && r.commitId !== headSha) {
-      ignored.push({ login: who, why: `approved ${short(r.commitId)}, not the head` });
-    } else if (bots.has(whoLc)) {
-      if (voidPaths.length) ignored.push({ login: who, why: 'bot approval void on never-auto-approve paths' });
+    else if (bots.has(whoLc)) {
+      if (!onHead) ignored.push({ login: who, why: `bot approved ${short(r.commitId)}, not the head` });
+      else if (voidPaths.length) ignored.push({ login: who, why: 'bot approval void on never-auto-approve paths' });
       else botApprovals.push(who);
     } else if (!hasWrite(permissions, who)) ignored.push({ login: who, why: 'no write access' });
-    else humans.push(who);
+    else if (onHead) humans.push(who);
+    else if (fresh) ignored.push({ login: who, why: `approved ${short(r.commitId)}, not the head` });
+    else if (tier.carry === 'low_only') {
+      const why = carryBlocker(config, input.changesSince?.[r.commitId], r.commitId);
+      if (why) ignored.push({ login: who, why });
+      else {
+        humans.push(who);
+        carried.push(who);
+      }
+    } else humans.push(who);
   }
   details.humanApprovals = humans;
+  details.carriedApprovals = carried;
   details.botApprovals = botApprovals;
   details.ignoredApprovals = ignored;
 
   const h = humans.length;
-  const pass = h >= need.humans && (!need.bot || botApprovals.length > 0 || h >= need.humans + 1);
+  const pass = h >= needHumans && h + (botApprovals.length > 0 ? 1 : 0) >= needTotal;
+  const botSlot = needTotal > needHumans;
 
   const label = expert ? `${SEV} (expert author ${author})` : SEV;
   const where = fresh ? `on ${short(headSha)}` : `(head ${short(headSha)})`;
   const plural = (n, word) => `${n} ${word}${n === 1 ? '' : 's'}`;
   let reason;
-  if (!need.bot) {
-    reason = `${label}: ${h} of ${plural(need.humans, 'human approval')} ${where}`;
+  if (!botSlot) {
+    reason = `${label}: ${h} of ${plural(needHumans, 'human approval')} ${where}`;
   } else {
     const have = `${plural(h, 'human approval')}${botApprovals.length ? ' and the bot' : ''}`;
     if (pass) {
       reason = h === 0 ? `${label}: bot approval ${where}` : `${label}: ${have} ${where}`;
     } else {
-      const want = need.humans
-        ? `${plural(need.humans, 'human approval')} plus the bot or another human`
+      const want = needHumans
+        ? `${plural(needHumans, 'human approval')} plus the bot or another human`
         : 'the bot or 1 human';
       const voidNote = voidPaths.length ? `; bot approval does not count for ${voidPaths[0]}` : '';
       reason = `${label}: needs ${want}, has ${have} ${where}${voidNote}`;
