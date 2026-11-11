@@ -31,6 +31,9 @@ function stringList(v, where, { globs = false } = {}) {
       throw new ConfigError(`${where}[${i}] must be a non-empty string`);
     }
     if (globs) {
+      if (s.startsWith('/') || s.startsWith('./') || s.endsWith('/')) {
+        throw new ConfigError(`${where}[${i}] "${s}" can never match a repository path (leading "/", leading "./", or trailing "/")`);
+      }
       try {
         globToRegExp(s);
       } catch (err) {
@@ -84,6 +87,9 @@ export function validateConfig(raw) {
     }
     if (t.carry !== undefined && t.fresh === true) {
       throw new ConfigError(`tiers.${sev}: fresh and carry cannot both be set`);
+    }
+    if (t.humans === 0 && t.bot !== true) {
+      throw new ConfigError(`tiers.${sev} requires no approvals: humans is 0 and bot is not true`);
     }
     tiers[sev] = { humans: t.humans, bot: t.bot === true, fresh: t.fresh === true, carry: t.carry ?? null };
   }

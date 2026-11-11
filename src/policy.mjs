@@ -85,7 +85,7 @@ function floorOf(config, path) {
 export function actorsToCheck(input) {
   const { config, labels, timeline, reviews, author } = input;
   const bots = new Set((config?.bots ?? []).map(lc));
-  const skip = new Set([ACTIONS_BOT, lc(author), lc(input.appLogin)]);
+  const skip = new Set([ACTIONS_BOT, lc(author), lc(input.appLogin), ...bots]);
   const out = new Set();
   for (const { actor } of latestLabelers(labels, timeline)) {
     if (actor && !skip.has(lc(actor))) out.add(lc(actor));
@@ -115,8 +115,11 @@ export function staleApprovalCommits(input) {
 // carryBlocker says why a human approval on an older commit cannot carry
 // to the head under "carry: low_only", or returns null if it can. It
 // carries only if the head descends from the approved commit and every
-// file changed since is outside the floor and never_auto_approve.
-function carryBlocker(config, since, sha) {
+// file changed since that the PR still touches is outside the floor and
+// never_auto_approve. Changes that only reached the branch by merging the
+// base in are not the PR's own, so they do not block the carry; a path
+// dropped from the diff no longer needs re-approval either.
+function carryBlocker(config, since, sha, prPaths) {
   const at = `approved ${short(sha)}`;
   if (!since) return `${at}, which cannot be compared with the head`;
   if (since.status !== 'ahead' && since.status !== 'identical') {
@@ -124,7 +127,7 @@ function carryBlocker(config, since, sha) {
   }
   if (!since.complete) return `${at}; too many files changed since to check`;
   const hit = changedPaths(since.files).find(
-    (p) => floorOf(config, p) || matchAny(config.neverAutoApprove, p),
+    (p) => prPaths.has(p) && (floorOf(config, p) || matchAny(config.neverAutoApprove, p)),
   );
   return hit ? `${at}; ${hit} changed since` : null;
 }
@@ -176,6 +179,7 @@ export function evaluate(input) {
     else if (lc(actor) === ACTIONS_BOT) why = `applied by ${ACTIONS_BOT}, which any workflow can act as`;
     else if (lc(actor) === authorLc) why = 'applied by the PR author';
     else if (appLc && lc(actor) === appLc) why = null;
+    else if (bots.has(lc(actor))) why = `applied by the bot ${actor}`;
     else if (!hasWrite(permissions, actor)) why = `applied by ${actor}, who lacks write access`;
     return { label, severity: sev, actor, counted: why === null, why };
   });
@@ -216,7 +220,9 @@ export function evaluate(input) {
   // Expert author: every floored path must be inside their globs. The
   // PR must touch at least one floored path, and must not edit the
   // policy file.
-  const expertGlobs = config.experts[authorLc];
+  // A login that names an Object.prototype property, like "constructor",
+  // is not an expert.
+  const expertGlobs = Object.hasOwn(config.experts, authorLc) ? config.experts[authorLc] : undefined;
   const expert =
     !!expertGlobs && !configEdited && floored.length > 0 && floored.every((p) => matchAny(expertGlobs, p));
   details.expert = expert;
@@ -231,6 +237,9 @@ export function evaluate(input) {
   let needTotal = tier.humans + (tier.bot ? 1 : 0);
   if (expert) {
     needHumans = Math.max(needHumans - 1, severity === 'critical' ? 1 : 0);
+    // Relief never raises the bar: a tier that asks for no humans, with
+    // the bot filling the slot, keeps that bar for an expert too.
+    needHumans = Math.min(needHumans, tier.humans);
     needTotal = Math.max(needTotal - 1, needHumans, Math.min(needTotal, 1));
   }
   details.requirement = { humans: needHumans, total: needTotal, fresh, carry: tier.carry };
@@ -242,6 +251,7 @@ export function evaluate(input) {
   const carried = [];
   const botApprovals = [];
   const ignored = [];
+  const pathSet = new Set(paths);
   for (const r of latestReviews(input.reviews)) {
     if (r.state !== 'APPROVED') continue;
     const who = r.user;
@@ -256,7 +266,7 @@ export function evaluate(input) {
     else if (onHead) humans.push(who);
     else if (fresh) ignored.push({ login: who, why: `approved ${short(r.commitId)}, not the head` });
     else if (tier.carry === 'low_only') {
-      const why = carryBlocker(config, input.changesSince?.[r.commitId], r.commitId);
+      const why = carryBlocker(config, input.changesSince?.[r.commitId], r.commitId, pathSet);
       if (why) ignored.push({ login: who, why });
       else {
         humans.push(who);

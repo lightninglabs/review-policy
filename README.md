@@ -237,6 +237,22 @@ commit. A queue entry passes when its PR still meets the policy. Approvals and
 labels are not re-collected from the queue commit, since the queue commit has
 no reviews of its own.
 
+## Shared head commits
+
+The verdict is per PR — author, labels, reviews, and base branch all feed
+it — but a check run is keyed by head commit. Two open PRs with the same
+head would otherwise overwrite each other's result: a looser PR could PASS
+over a stricter one's FAIL, and anyone could open an unlabeled twin to
+write FAIL over a PASS. When the PR being evaluated shares its head with
+other open PRs, the check evaluates every one of them and reports the
+strictest result, failing closed in both directions. Closing a twin
+re-triggers the remaining PR through the `closed` event and restores its
+own verdict.
+
+The same fail-closed rule covers errors: any failure to gather inputs or
+evaluate writes a failing check on the target commit before the run exits,
+so an earlier PASS cannot stand in for a run that never finished.
+
 ## Using it in a repository
 
 Two short workflows, both running from the default branch:
@@ -246,7 +262,10 @@ Two short workflows, both running from the default branch:
 name: review-policy
 on:
   pull_request_target:
-    types: [opened, synchronize, reopened, labeled, unlabeled, ready_for_review]
+    # edited: retargeting at another base branch re-evaluates against that
+    # base's policy. closed: a PR sharing its head with a closed twin is
+    # re-evaluated on its own (see "Shared head commits").
+    types: [opened, synchronize, reopened, labeled, unlabeled, ready_for_review, edited, closed]
   merge_group:
   workflow_run:
     workflows: [review-policy-relay]
@@ -304,6 +323,18 @@ merges before making it required.
 2. Add the App's private key there as the secret `REVIEW_POLICY_APP_KEY`, and
    its id as the variable `REVIEW_POLICY_APP_ID`.
 
+One caveat to validate before relying on the key: it is not yet confirmed
+against a live repository how GitHub applies the deployment-branch policy to
+`merge_group` jobs, whose ref is `refs/heads/gh-readonly-queue/<base>/...`,
+or to `pull_request_target` jobs for PRs that target a non-default branch. If
+the policy rejects those refs, merge-queue entries get no check and stall,
+and release-branch PRs are unchecked. Widening the policy to
+`gh-readonly-queue/*` needs a ruleset that blocks users from creating refs
+with that prefix, or anyone who can push such a branch can read the key. The
+`merge_group` path has so far been exercised only against a fake API. Until
+this is settled, the GITHUB_TOKEN fallback is the safe way to trial the
+check.
+
 The action signs a JWT with the key (RS256, built-in `node:crypto`), mints an
 installation token limited to this repository with `checks: write`,
 `contents: read`, and `pull-requests: read`, uses it for every API call, and
@@ -342,6 +373,9 @@ The tests fail if `dist/` is out of date.
   head, which covers the LOW path; a stricter option is to treat a label
   applied before the latest push as stale.
 - Who creates and owns the review bot user and the review-policy App?
+- Does the `review-policy` environment's deployment-branch policy admit
+  `merge_group` and non-default-base `pull_request_target` jobs on a live
+  repository? See "Setting up the App key".
 
 ## Related
 

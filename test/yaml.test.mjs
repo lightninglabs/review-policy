@@ -24,6 +24,11 @@ test('sequence at the same indent as its key', () => {
   assert.deepEqual(parseYaml('a:\n- x\n- "y"\nb: 1'), { a: ['x', 'y'], b: 1 });
 });
 
+test('a tab before a trailing comment still starts the comment', () => {
+  assert.deepEqual(parseYaml('a:\n  - go.mod\t# pin'), { a: ['go.mod'] });
+  assert.deepEqual(parseYaml('a: x\t# c'), { a: 'x' });
+});
+
 test('multi-line flow collections and trailing commas', () => {
   assert.deepEqual(parseYaml('a: [\n  "x",  # one\n  y,\n]\nb: { c: 1,\n d: [e] }'), { a: ['x', 'y'], b: { c: 1, d: ['e'] } });
 });

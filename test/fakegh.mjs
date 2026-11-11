@@ -66,7 +66,11 @@ export function fakeGitHub(state) {
     }],
     ['GET', /^\/collaborators\/([^/]+)\/permission$/, (m) => {
       const p = state.permissions?.[decodeURIComponent(m[1]).toLowerCase()];
-      return p ? [200, { permission: p === 'maintain' ? 'write' : p, role_name: p }] : [404, { message: 'Not Found' }];
+      if (!p) return [404, { message: 'Not Found' }];
+      // An object gives the raw API response, for custom repository
+      // roles whose role_name is not a legacy permission.
+      if (typeof p === 'object') return [200, p];
+      return [200, { permission: p === 'maintain' ? 'write' : p, role_name: p }];
     }],
     ['GET', /^\/compare\/([0-9a-f]+)\.\.\.([0-9a-f]+)$/, (m) => {
       const c = state.compare?.[m[1]];
@@ -113,6 +117,9 @@ export function fakeGitHub(state) {
     else return respond(401, { message: 'Bad credentials' });
     if (!url.pathname.startsWith(repo + '/')) return respond(404, { message: 'Not Found' });
     const path = url.pathname.slice(repo.length);
+    // Injected failures: state.errors maps "METHOD path" to a status.
+    const fail = state.errors?.[`${method} ${path}`];
+    if (fail) return respond(fail, { message: 'injected error' });
     for (const [m, re, fn] of routes) {
       const match = m === method && re.exec(path);
       if (match) {

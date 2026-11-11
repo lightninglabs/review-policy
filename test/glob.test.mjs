@@ -26,6 +26,16 @@ const cases = [
   ['file?.txt', 'file/.txt', false],
   ['a+b/(c)', 'a+b/(c)', true],
   ['**', 'anything/at/all', true],
+  // Git allows newlines and line separators in file names; a trailing
+  // "**" must still match them.
+  ['sqldb/**', 'sqldb/m\n.go', true],
+  ['sqldb/**', 'sqldb/m\r.go', true],
+  ['sqldb/**', 'sqldb/m\u2028.go', true],
+  ['sqldb/**', 'sqldb/m\u2029.go', true],
+  ['.github/**', '.github/workflows/x\n.yml', true],
+  ['**', 'a\n/b', true],
+  ['*', 'm\n.go', true],
+  ['file?.txt', 'file\n.txt', true],
 ];
 for (const [pat, path, want] of cases) {
   test(`${pat} ${want ? 'matches' : 'does not match'} ${path}`, () => assert.equal(matchGlob(pat, path), want));

@@ -38,7 +38,7 @@ experts:
 `;
 
 export const config = parseConfig(README_CONFIG);
-export const HEAD = 'abc1234def5678900000000000000000000000000';
+export const HEAD = 'abc1234def567890000000000000000000000000';
 export const OLD = '0ld0000000000000000000000000000000000000';
 export const BOT = 'll-review-bot';
 // The review-policy App's bot login, which applies the classifier's labels.

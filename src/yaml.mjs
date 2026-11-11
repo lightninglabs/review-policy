@@ -18,7 +18,8 @@ export class YamlError extends Error {
 const RESERVED_START = new Set(['&', '*', '!', '|', '>', '%', '@', '`']);
 
 // stripComment removes a trailing comment that is outside quotes. A '#'
-// starts a comment only at the start of the line or after whitespace.
+// starts a comment only at the start of the line or after whitespace
+// (space or tab; tabs are only invalid as indentation).
 function stripComment(text, lineNo) {
   let quote = null;
   for (let i = 0; i < text.length; i++) {
@@ -33,7 +34,7 @@ function stripComment(text, lineNo) {
       }
     } else if (c === '"' || c === "'") {
       quote = c;
-    } else if (c === '#' && (i === 0 || text[i - 1] === ' ')) {
+    } else if (c === '#' && (i === 0 || text[i - 1] === ' ' || text[i - 1] === '\t')) {
       return text.slice(0, i);
     }
   }

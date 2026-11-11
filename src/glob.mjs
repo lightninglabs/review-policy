@@ -21,8 +21,9 @@ export function globToRegExp(pattern) {
     const last = i === segs.length - 1;
     if (seg === '**') {
       // "a/**" matches everything under a; "**/b" and "a/**/b" match zero
-      // or more directories in between.
-      re += last ? '.*' : '(?:[^/]+/)*';
+      // or more directories in between. [^] rather than . so that file
+      // names containing \n, \r, U+2028 or U+2029 still match.
+      re += last ? '[^]*' : '(?:[^/]+/)*';
       continue;
     }
     if (seg.includes('**')) throw new Error(`"**" must be a whole path segment in "${pattern}"`);

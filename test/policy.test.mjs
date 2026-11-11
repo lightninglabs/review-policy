@@ -97,6 +97,18 @@ describe('rule: severity label', () => {
     assert.match(r.reason, /^needs severity.*severity-low applied by the PR author/);
   });
 
+  test('applied by a configured bot is ignored, even with write access', () => {
+    const r = evaluate(input({
+      severity: null,
+      labels: ['severity-low'],
+      timeline: [lab('severity-low', BOT)],
+      reviews: [approve(BOT)],
+      permissions: { [BOT]: 'write' },
+    }));
+    assert.equal(r.pass, false);
+    assert.match(r.reason, /^needs severity.*severity-low applied by the bot ll-review-bot/);
+  });
+
   test('author cannot lower a classifier label by adding a lower one', () => {
     const r = evaluate(input({
       severity: null,
@@ -276,6 +288,12 @@ describe('rule: approvals', () => {
 
 describe('rule: fresh vs carried approvals', () => {
   const since = (files, status = 'ahead', complete = true) => ({ [OLD]: { status, files, complete } });
+  // Everything the in-diff carry tests touch floors LOW here, so a
+  // MEDIUM-labeled PR keeps its tier when the path is part of its diff.
+  const lowFloor = {
+    ...config,
+    floor: { low: ['htlcswitch/**', 'channeldb/migration*/**', 'lnwallet/**'], medium: [], high: [], critical: [] },
+  };
 
   test('MEDIUM (carry: low_only): an approval carries past low-risk changes', () => {
     const r = evaluate(input({ severity: 'medium', reviews: [approve('maint1', OLD)], changesSince: since(['docs/x.md', 'lnrpc/a.go']) }));
@@ -288,17 +306,27 @@ describe('rule: fresh vs carried approvals', () => {
     ['a CRITICAL-floored path', 'channeldb/migration33/m.go', /migration33\/m.go changed since/],
     ['a never-auto-approve path', 'go.mod', /go.mod changed since/],
     ['a nested never-auto-approve path', 'lnrpc/AGENTS.md', /AGENTS.md changed since/],
-    ['the policy file', '.github/review-policy.yml', /review-policy.yml changed since/],
   ]) {
-    test(`MEDIUM (carry: low_only): ${what} changed since blocks the carry`, () => {
-      const r = evaluate(input({ severity: 'medium', reviews: [approve('maint1', OLD)], changesSince: since(['docs/x.md', file]) }));
+    test(`MEDIUM (carry: low_only): ${what} changed since, in the PR's diff, blocks the carry`, () => {
+      const r = evaluate(input({ config: lowFloor, files: ['docs/readme.md', file], severity: 'medium', reviews: [approve('maint1', OLD)], changesSince: since(['docs/x.md', file]) }));
       assert.equal(r.pass, false);
       assert.match(r.details.ignoredApprovals[0].why, why);
     });
   }
 
+  test('MEDIUM (carry: low_only): base-branch churn does not block the carry', () => {
+    // A floored, never-auto-approve, or policy path that changed only
+    // because the base branch moved is not part of what was approved.
+    for (const churn of ['htlcswitch/switch.go', 'go.mod', 'channeldb/migration33/m.go', '.github/review-policy.yml']) {
+      const r = evaluate(input({ severity: 'medium', reviews: [approve('maint1', OLD)], changesSince: since(['docs/x.md', churn]) }));
+      assert.equal(r.pass, true, churn);
+      assert.deepEqual(r.details.carriedApprovals, ['maint1']);
+    }
+  });
+
   test('MEDIUM (carry: low_only): a rename out of a floored path blocks the carry', () => {
-    const r = evaluate(input({ severity: 'medium', reviews: [approve('maint1', OLD)], changesSince: since([{ filename: 'misc/w.go', previous_filename: 'lnwallet/w.go' }]) }));
+    const rename = { filename: 'misc/w.go', previous_filename: 'lnwallet/w.go' };
+    const r = evaluate(input({ config: lowFloor, files: [rename], severity: 'medium', reviews: [approve('maint1', OLD)], changesSince: since([rename]) }));
     assert.equal(r.pass, false);
   });
 
@@ -563,6 +591,36 @@ describe('rule: experts', () => {
     const v = evaluate(input({ author: 'Alice', severity: 'high', files: ['routing/a.go'], reviews: [approve(BOT)] }));
     assert.equal(v.details.expert, true);
   });
+
+  test('an author named after an Object.prototype property is not an expert', () => {
+    const v = evaluate(input({ author: 'constructor', severity: 'high', files: ['htlcswitch/a.go'], reviews: [approve('maint1')] }));
+    assert.equal(v.details.expert, false);
+    assert.equal(v.pass, true);
+  });
+
+  test('expert relief never raises the bar: CRITICAL with humans: 0 and the bot', () => {
+    const cfg = parseConfig(`version: 1
+bots: ["${BOT}"]
+floor:
+  critical: ["sqldb/**"]
+tiers:
+  low: { humans: 0, bot: true }
+  medium: { humans: 1 }
+  high: { humans: 1 }
+  critical: { humans: 0, bot: true }
+experts:
+  alice: ["sqldb/**"]
+`);
+    // A non-expert passes on the bot alone.
+    const plain = evaluate(input({ config: cfg, files: ['sqldb/a.go'], severity: 'critical', reviews: [approve(BOT)] }));
+    assert.equal(plain.pass, true);
+    // The expert gets the same bar: relief cannot demand more humans
+    // than the tier itself asks for.
+    const expert = evaluate(input({ config: cfg, files: ['sqldb/a.go'], severity: 'critical', author: 'alice', reviews: [approve(BOT)] }));
+    assert.equal(expert.details.expert, true);
+    assert.deepEqual(expert.details.requirement, { humans: 0, total: 1, fresh: false, carry: null });
+    assert.equal(expert.pass, true);
+  });
 });
 
 describe('actorsToCheck', () => {
@@ -573,6 +631,14 @@ describe('actorsToCheck', () => {
       reviews: [approve('maint2'), approve(BOT), approve('author'), approve('x', HEAD, 'CHANGES_REQUESTED')],
     }));
     assert.deepEqual(got, ['maint1', 'maint2']);
+  });
+
+  test('skips a configured bot that applied a label', () => {
+    const got = actorsToCheck(input({
+      labels: ['severity-low'],
+      timeline: [lab('severity-low', BOT)],
+    }));
+    assert.deepEqual(got, []);
   });
 });
 

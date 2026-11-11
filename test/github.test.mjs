@@ -440,34 +440,193 @@ describe('merge_group', () => {
 
 describe('carry: low_only through the compare API', () => {
   const APPROVED = 'b'.repeat(40);
-  const medium = (reviews) => prState({ labels: ['severity-medium'], timeline: [{ event: 'labeled', label: { name: 'severity-medium' }, actor: { login: APP } }], reviews });
+  // routing/** floors LOW here instead of HIGH, so a MEDIUM PR keeps its
+  // tier when the path is part of its own diff.
+  const CARRY_CONFIG = README_CONFIG
+    .replace('  high: ["htlcswitch/**", "routing/**", "peer/**"]', '  high: ["htlcswitch/**", "peer/**"]')
+    .replace('floor:\n', 'floor:\n  low: ["routing/**"]\n');
+  const medium = (reviews, over = {}) => prState({
+    labels: ['severity-medium'],
+    timeline: [{ event: 'labeled', label: { name: 'severity-medium' }, actor: { login: APP } }],
+    reviews,
+    ...over,
+  });
+  const carryWorld = (pr, compare) => world(pr, { compare, config: { master: CARRY_CONFIG } });
 
   test('carries an approval when only low-risk files changed since', async () => {
-    const gh = world(medium([review(1, 'maint1', 'APPROVED', APPROVED)]), { compare: { [APPROVED]: { files: ['docs/a.md'] } } });
+    const gh = carryWorld(medium([review(1, 'maint1', 'APPROVED', APPROVED)]), { [APPROVED]: { files: ['docs/a.md'] } });
     const [r] = await run({ env: env('pull_request_target', { pull_request: { number: 7 } }), fetch: gh.fetch, log: quiet });
     assert.ok(gh.calls.some((c) => c === `GET /repos/${REPO}/compare/${APPROVED}...${HEAD}`));
     assert.equal(r.pass, true, r.reason);
     assert.match(gh.state.checkRuns[0].output.summary, /Carried from older commits \| maint1/);
   });
 
-  for (const [what, compare] of [
-    ['a floored file', { [APPROVED]: { files: ['docs/a.md', 'routing/r.go'] } }],
-    ['a never-auto-approve file', { [APPROVED]: { files: ['scripts/x.sh'] } }],
-    ['the policy file', { [APPROVED]: { files: ['.github/review-policy.yml'] } }],
-    ['a force-push', { [APPROVED]: { status: 'diverged', files: ['docs/a.md'] } }],
-    ['300 or more files', { [APPROVED]: { files: Array.from({ length: 300 }, (_, i) => `docs/${i}.md`) } }],
-    ['an unknown commit', {}],
+  test('carries an approval past base-branch churn', async () => {
+    // routing/r.go and go.mod changed only because the base branch moved;
+    // neither is part of the PR's own diff.
+    const gh = carryWorld(medium([review(1, 'maint1', 'APPROVED', APPROVED)]), { [APPROVED]: { files: ['docs/a.md', 'routing/r.go', 'go.mod'] } });
+    const [r] = await run({ env: env('pull_request_target', { pull_request: { number: 7 } }), fetch: gh.fetch, log: quiet });
+    assert.equal(r.pass, true, r.reason);
+    assert.match(r.reason, /MEDIUM: 1 of 1 human approval/);
+  });
+
+  for (const [what, prOver, compare] of [
+    ['a floored file', { files: [{ filename: 'docs/a.md' }, { filename: 'routing/r.go' }] }, { [APPROVED]: { files: ['docs/a.md', 'routing/r.go'] } }],
+    ['a never-auto-approve file', { files: [{ filename: 'docs/a.md' }, { filename: 'scripts/x.sh' }] }, { [APPROVED]: { files: ['docs/a.md', 'scripts/x.sh'] } }],
+    ['the policy file', { files: [{ filename: 'docs/a.md' }, { filename: '.github/review-policy.yml' }] }, { [APPROVED]: { files: ['docs/a.md', '.github/review-policy.yml'] } }],
+    ['a force-push', {}, { [APPROVED]: { status: 'diverged', files: ['docs/a.md'] } }],
+    ['300 or more files', {}, { [APPROVED]: { files: Array.from({ length: 300 }, (_, i) => `docs/${i}.md`) } }],
+    ['an unknown commit', {}, {}],
   ]) {
     test(`does not carry past ${what}`, async () => {
-      const gh = world(medium([review(1, 'maint1', 'APPROVED', APPROVED)]), { compare });
+      const gh = carryWorld(medium([review(1, 'maint1', 'APPROVED', APPROVED)], prOver), compare);
       const [r] = await run({ env: env('pull_request_target', { pull_request: { number: 7 } }), fetch: gh.fetch, log: quiet });
       assert.equal(r.pass, false);
     });
   }
 
+  test('reports the in-diff file that blocked the carry', async () => {
+    const gh = carryWorld(
+      medium([review(1, 'maint1', 'APPROVED', APPROVED)], { files: [{ filename: 'docs/a.md' }, { filename: 'routing/r.go' }] }),
+      { [APPROVED]: { files: ['docs/a.md', 'routing/r.go'] } },
+    );
+    const [r] = await run({ env: env('pull_request_target', { pull_request: { number: 7 } }), fetch: gh.fetch, log: quiet });
+    assert.match(r.details.ignoredApprovals[0].why, /routing\/r.go changed since/);
+  });
+
   test('does not call the compare API for approvals on the head', async () => {
     const gh = world(medium([review(1, 'maint1')]));
     await run({ env: env('pull_request_target', { pull_request: { number: 7 } }), fetch: gh.fetch, log: quiet });
     assert.ok(!gh.calls.some((c) => c.includes('/compare/')));
+  });
+});
+
+describe('fail closed on errors', () => {
+  test('a 5xx while gathering inputs writes a failing check on the head', async () => {
+    const gh = world(prState({ reviews: [review(1, BOT)] }), { errors: { 'GET /issues/7/timeline': 503 } });
+    const e = env('pull_request_target', { pull_request: { number: 7, head: { sha: HEAD } } });
+    await assert.rejects(run({ env: e, fetch: gh.fetch, log: quiet }), /503/);
+    assert.equal(gh.state.checkRuns.length, 1);
+    assert.equal(gh.state.checkRuns[0].head_sha, HEAD);
+    assert.equal(gh.state.checkRuns[0].conclusion, 'failure');
+    assert.match(gh.state.checkRuns[0].output.title, /could not evaluate PR #7/);
+  });
+
+  test('a missing PR on merge_group fails closed on the group head', async () => {
+    const gh = world();
+    delete gh.state.prs[7];
+    await assert.rejects(run({ env: env('merge_group', groupEvent()), fetch: gh.fetch, log: quiet }), /404/);
+    assert.equal(gh.state.checkRuns.length, 1);
+    assert.equal(gh.state.checkRuns[0].head_sha, GROUP_SHA);
+    assert.equal(gh.state.checkRuns[0].conclusion, 'failure');
+  });
+
+  test('a missing PR on pull_request_target falls back to the payload head', async () => {
+    const gh = world();
+    delete gh.state.prs[7];
+    const sha = 'e'.repeat(40);
+    const e = env('pull_request_target', { pull_request: { number: 7, head: { sha } } });
+    await assert.rejects(run({ env: e, fetch: gh.fetch, log: quiet }), /404/);
+    assert.equal(gh.state.checkRuns.length, 1);
+    assert.equal(gh.state.checkRuns[0].head_sha, sha);
+    assert.equal(gh.state.checkRuns[0].conclusion, 'failure');
+  });
+
+  test('a failing check that cannot be written still fails the run', async () => {
+    const gh = world(prState({ reviews: [review(1, BOT)] }), {
+      errors: { 'GET /issues/7/timeline': 503, 'POST /check-runs': 503, [`GET /commits/${HEAD}/check-runs`]: 503 },
+    });
+    const e = env('pull_request_target', { pull_request: { number: 7, head: { sha: HEAD } } });
+    await assert.rejects(run({ env: e, fetch: gh.fetch, log: quiet }), /503/);
+  });
+});
+
+describe('shared head commit', () => {
+  // PR #8 is a twin of #7: the same head commit, opened by someone else.
+  const twin = (over = {}) => {
+    const { pull: pullOver, ...rest } = over;
+    return {
+      pull: {
+        number: 8,
+        user: { login: 'outsider' },
+        head: { sha: HEAD },
+        base: { ref: 'master' },
+        labels: [],
+        changed_files: 1,
+        ...pullOver,
+      },
+      files: [{ filename: 'docs/a.md' }],
+      reviews: [],
+      timeline: [],
+      ...rest,
+    };
+  };
+  const labeled = (name, actor) => ({ event: 'labeled', label: { name }, actor: { login: actor } });
+
+  test("one PR's PASS cannot cover a stricter twin's FAIL", async () => {
+    // #7's author applied its label themselves, so #7 has no counted
+    // severity. The same label counts on #8, where they are not the
+    // author. Both share the head; the strictest verdict is reported.
+    const gh = world(
+      prState({ labels: ['severity-low'], timeline: [labeled('severity-low', 'author')], reviews: [review(1, BOT)] }),
+      { permissions: { maint1: 'write', maint2: 'admin', author: 'write' } },
+    );
+    gh.state.prs[8] = twin({
+      pull: { labels: [{ name: 'severity-low' }] },
+      timeline: [labeled('severity-low', 'author')],
+      reviews: [review(2, BOT)],
+    });
+    const [r] = await run({ env: env('pull_request_target', { pull_request: { number: 7 } }), fetch: gh.fetch, log: quiet });
+    assert.equal(r.pass, false);
+    assert.match(r.reason, /head shared by #7, #8; strictest, from #7: needs severity/);
+    assert.equal(gh.state.checkRuns.length, 1);
+    assert.equal(gh.state.checkRuns[0].head_sha, HEAD);
+    assert.equal(gh.state.checkRuns[0].conclusion, 'failure');
+    assert.match(gh.state.checkRuns[0].output.summary, /Shared head \| #7, #8/);
+  });
+
+  test('an unlabeled twin fails an otherwise passing PR closed', async () => {
+    const gh = world(prState({ reviews: [review(1, BOT)] }));
+    gh.state.prs[8] = twin();
+    const [r] = await run({ env: env('pull_request_target', { pull_request: { number: 7 } }), fetch: gh.fetch, log: quiet });
+    assert.equal(r.pass, false);
+    assert.match(r.reason, /strictest, from #8: needs severity/);
+    assert.equal(gh.state.checkRuns[0].conclusion, 'failure');
+  });
+
+  test('when every PR sharing the head passes, the check passes', async () => {
+    const gh = world(prState({ reviews: [review(1, BOT)] }));
+    gh.state.prs[8] = twin({
+      pull: { labels: [{ name: 'severity-low' }] },
+      timeline: [labeled('severity-low', 'maint1')],
+      reviews: [review(2, BOT)],
+    });
+    const [r] = await run({ env: env('pull_request_target', { pull_request: { number: 7 } }), fetch: gh.fetch, log: quiet });
+    assert.equal(r.pass, true, r.reason);
+    assert.match(r.reason, /head shared by #7, #8, all passing/);
+    assert.equal(gh.state.checkRuns[0].conclusion, 'success');
+  });
+
+  test('a twin on another branch is not fetched when heads differ', async () => {
+    const gh = world(prState({ reviews: [review(1, BOT)] }));
+    gh.state.prs[8] = twin({ pull: { head: { sha: 'f'.repeat(40) } } });
+    const [r] = await run({ env: env('pull_request_target', { pull_request: { number: 7 } }), fetch: gh.fetch, log: quiet });
+    assert.equal(r.pass, true, r.reason);
+    assert.ok(!gh.calls.some((c) => c.includes('/pulls/8/')));
+  });
+});
+
+describe('collaborator permission', () => {
+  test('a maintainer on an org custom role counts via the legacy permission field', async () => {
+    const gh = world(
+      prState({
+        labels: ['severity-high'],
+        timeline: [{ event: 'labeled', label: { name: 'severity-high' }, actor: { login: 'coredev' } }],
+        reviews: [review(1, 'coredev')],
+      }),
+      { permissions: { coredev: { permission: 'write', role_name: 'core-dev' } } },
+    );
+    const [r] = await run({ env: env('pull_request_target', { pull_request: { number: 7 } }), fetch: gh.fetch, log: quiet });
+    assert.equal(r.pass, true, r.reason);
   });
 });

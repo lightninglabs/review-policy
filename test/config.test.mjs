@@ -28,7 +28,7 @@ for (const [name, src, re] of [
   ['wrong version', `version: 2\n${tiers}`, /version must be 1/],
   ['missing version', tiers, /version must be 1/],
   ['unknown top-level key', `version: 1\nbot: [x]\n${tiers}`, /unknown key "bot"/],
-  ['missing tier', 'version: 1\ntiers:\n  low: {humans: 0}\n  medium: {humans: 1}\n  high: {humans: 1}\n', /tiers.critical is required/],
+  ['missing tier', 'version: 1\ntiers:\n  low: {humans: 0, bot: true}\n  medium: {humans: 1}\n  high: {humans: 1}\n', /tiers.critical is required/],
   ['unknown tier', `version: 1\n${tiers}  extreme: {humans: 3}\n`, /unknown key "extreme"/],
   ['negative humans', 'version: 1\ntiers:\n  low: {humans: -1}\n  medium: {humans: 1}\n  high: {humans: 1}\n  critical: {humans: 2}\n', /non-negative integer/],
   ['string humans', 'version: 1\ntiers:\n  low: {humans: "0"}\n  medium: {humans: 1}\n  high: {humans: 1}\n  critical: {humans: 2}\n', /non-negative integer/],
@@ -38,8 +38,13 @@ for (const [name, src, re] of [
   ['bad glob', `version: 1\nfloor:\n  high: ["a**/b"]\n${tiers}`, /whole path segment/],
   ['empty expert', `version: 1\nexperts:\n  bob: []\n${tiers}`, /at least one glob/],
   ['bad YAML', 'version: 1\n  x: 2', /cannot parse YAML/],
-  ['unknown carry mode', 'version: 1\ntiers:\n  low: {humans: 0}\n  medium: {humans: 1, carry: always}\n  high: {humans: 1}\n  critical: {humans: 2}\n', /carry must be one of: low_only/],
-  ['carry with fresh', 'version: 1\ntiers:\n  low: {humans: 0}\n  medium: {humans: 1, carry: low_only, fresh: true}\n  high: {humans: 1}\n  critical: {humans: 2}\n', /fresh and carry cannot both be set/],
+  ['unknown carry mode', 'version: 1\ntiers:\n  low: {humans: 0, bot: true}\n  medium: {humans: 1, carry: always}\n  high: {humans: 1}\n  critical: {humans: 2}\n', /carry must be one of: low_only/],
+  ['carry with fresh', 'version: 1\ntiers:\n  low: {humans: 0, bot: true}\n  medium: {humans: 1, carry: low_only, fresh: true}\n  high: {humans: 1}\n  critical: {humans: 2}\n', /fresh and carry cannot both be set/],
+  ['no approvals required', 'version: 1\ntiers:\n  low: {humans: 0}\n  medium: {humans: 1}\n  high: {humans: 1}\n  critical: {humans: 2}\n', /tiers.low requires no approvals/],
+  ['glob with leading slash', `version: 1\nfloor:\n  high: [/sqldb/**]\n${tiers}`, /can never match a repository path/],
+  ['glob with leading ./', `version: 1\nfloor:\n  high: [./sqldb/**]\n${tiers}`, /can never match a repository path/],
+  ['glob with trailing slash', `version: 1\nnever_auto_approve: [sqldb/]\n${tiers}`, /can never match a repository path/],
+  ['glob with trailing slash on an expert', `version: 1\nexperts:\n  bob: [sqldb/]\n${tiers}`, /can never match a repository path/],
 ]) {
   test(`rejects ${name}`, () => assert.throws(() => parseConfig(src), re));
 }

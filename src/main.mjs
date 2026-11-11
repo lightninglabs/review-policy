@@ -100,7 +100,11 @@ async function readConfig(client, repo, ref) {
 async function permission(client, repo, login) {
   try {
     const d = await client.request('GET', `/repos/${repo}/collaborators/${encodeURIComponent(login)}/permission`);
-    return d?.role_name || d?.permission || 'none';
+    // The legacy permission field already maps any role, including org
+    // custom repository roles, onto admin/maintain/write/triage/read.
+    // role_name would report the custom role's name instead, which is not
+    // a known write permission.
+    return d?.permission || d?.role_name || 'none';
   } catch (err) {
     if (err.status === 404) return 'none';
     throw err;
@@ -174,6 +178,7 @@ export function summarize(result, { spoofable = false } = {}) {
   const row = (k, v) => lines.push(`| ${k} | ${String(v).replace(/\|/g, '\\|').replace(/\n/g, ' ')} |`);
   lines.push('| | |', '| --- | --- |');
   if (d.mergeGroup) row('Merge group', `\`${d.mergeGroup.headSha}\`, evaluated as PR #${d.mergeGroup.number}`);
+  if (d.sharedHead) row('Shared head', `${d.sharedHead.map((n) => `#${n}`).join(', ')}; strictest result reported`);
   if (d.headSha) row('Head', `\`${d.headSha}\``);
   if (d.author) row('Author', d.author);
   if (result.severity) row('Severity', result.severity.toUpperCase());
@@ -239,9 +244,53 @@ async function authenticate(env, repo, fetch, log) {
   return { token: env.INPUT_TOKEN || env.GITHUB_TOKEN, slug: 'github-actions', login: ACTIONS_BOT, apiUrl, spoofable: true };
 }
 
+// evaluateSharedHead evaluates the target PR plus every other open PR
+// with the same head commit and returns the strictest result. The verdict
+// is per PR — author, labels, reviews, and base branch all feed it — but
+// the check run is keyed by head SHA, so two PRs sharing a head would
+// otherwise overwrite each other's result: a looser PR could PASS over a
+// stricter one's FAIL, and anyone could open an unlabeled twin to write
+// FAIL over a PASS. Reporting the strictest fails closed in both
+// directions.
+async function evaluateSharedHead(client, repo, open, number, input, appLogin) {
+  const twins = open.filter((p) => p.number !== number && p.head?.sha === input.headSha);
+  const result = evaluate(input);
+  if (twins.length === 0) return result;
+  const verdicts = [{ number, result }];
+  for (const twin of twins) {
+    const twinInput = await gatherInputs(client, repo, twin.number, { appLogin });
+    verdicts.push({ number: twin.number, result: evaluate(twinInput) });
+  }
+  verdicts.sort((a, b) => a.number - b.number);
+  const failing = verdicts.filter((v) => !v.result.pass);
+  const sharedHead = verdicts.map((v) => v.number);
+  const asList = sharedHead.map((n) => `#${n}`).join(', ');
+  if (failing.length > 0) {
+    const strictest = failing[0];
+    const others = failing.length > 1 ? ` (${failing.length - 1} more failing)` : '';
+    return {
+      ...strictest.result,
+      reason: `head shared by ${asList}; strictest, from #${strictest.number}${others}: ${strictest.result.reason}`,
+      details: { ...strictest.result.details, sharedHead },
+    };
+  }
+  const own = verdicts.find((v) => v.number === number);
+  return {
+    ...own.result,
+    reason: `head shared by ${asList}, all passing; #${number}: ${own.result.reason}`,
+    details: { ...own.result.details, sharedHead },
+  };
+}
+
+// A SHA the event payload names, valid to report a failure on when the
+// event cannot be read at all.
+const HEX_SHA = /^[0-9a-f]{40}([0-9a-f]{24})?$/;
+
 // run evaluates every PR the event refers to and writes one check run
 // per PR head, or on the merge group's head for merge_group. It returns
-// the results.
+// the results. Every error path first tries to write a failing check on
+// the relevant commit, so an earlier PASS cannot stand in for a run that
+// never finished.
 export async function run({ env = process.env, fetch = globalThis.fetch, log = console.log } = {}) {
   const repo = env.GITHUB_REPOSITORY;
   if (!repo || !/^[^/]+\/[^/]+$/.test(repo)) throw new Error('GITHUB_REPOSITORY is not set');
@@ -257,34 +306,63 @@ export async function run({ env = process.env, fetch = globalThis.fetch, log = c
       appendFileSync(env.GITHUB_STEP_SUMMARY, `### ${title}\n\n${summarize(result, report)}\n\n`);
     }
   };
+  // failClosed writes a failing check on sha, swallowing any error of its
+  // own: the original error is the one the run rethrows.
+  const failClosed = async (sha, message) => {
+    const result = { pass: false, severity: null, reason: message, details: {} };
+    try {
+      await writeCheck(client, repo, sha, result, report);
+      summary(`fail closed ${sha.slice(0, 7)}`, result);
+    } catch {
+      // Nothing more can be reported; the run still fails.
+    }
+  };
   try {
     let targets;
     try {
       targets = await prTargets(client, repo, env.GITHUB_EVENT_NAME, event);
     } catch (err) {
-      // Fail closed: a queue entry the check cannot read gets a failing
-      // check rather than none.
-      const sha = event.merge_group?.head_sha;
-      if (err instanceof MergeGroupError && /^[0-9a-f]{40}([0-9a-f]{24})?$/.test(String(sha))) {
-        const result = { pass: false, severity: null, reason: err.message, details: {} };
-        await writeCheck(client, repo, sha, result, report);
-        summary(`merge group ${sha.slice(0, 7)}`, result);
+      // Fail closed on every commit the payload names: a queue entry or
+      // PR the check cannot read gets a failing check rather than none.
+      const shas = [event.merge_group?.head_sha, event.pull_request?.head?.sha, event.workflow_run?.head_sha];
+      for (const sha of new Set(shas.filter((s) => HEX_SHA.test(String(s))))) {
+        await failClosed(String(sha), err.message);
       }
       throw err;
     }
     if (targets.length === 0) log('review-policy: no pull request for this event');
     const results = [];
+    // Open PRs are listed lazily, once, so every PR sharing a head commit
+    // can be evaluated together. merge_group reports on its own head and
+    // does not need the list.
+    let open = null;
     for (const { number, reportSha, base } of targets) {
-      const input = await gatherInputs(client, repo, number, { appLogin });
-      let result = evaluate(input);
-      if (base !== undefined && input.baseRef !== base) {
-        result = { ...result, pass: false, reason: `PR #${number} targets ${input.baseRef}, not the merge group's base ${base}` };
+      let input;
+      try {
+        input = await gatherInputs(client, repo, number, { appLogin });
+        let result;
+        if (reportSha === undefined) {
+          open ??= await client.paginate(`/repos/${repo}/pulls`, { query: { state: 'open', per_page: 100 } });
+          result = await evaluateSharedHead(client, repo, open, number, input, appLogin);
+        } else {
+          result = evaluate(input);
+        }
+        if (base !== undefined && input.baseRef !== base) {
+          result = { ...result, pass: false, reason: `PR #${number} targets ${input.baseRef}, not the merge group's base ${base}` };
+        }
+        if (reportSha) result.details = { ...result.details, mergeGroup: { headSha: reportSha, number } };
+        await writeCheck(client, repo, reportSha ?? input.headSha, result, report);
+        log(`review-policy: #${number} ${result.pass ? 'PASS' : 'FAIL'}: ${result.reason}`);
+        summary(`#${number}`, result);
+        results.push({ number, ...result });
+      } catch (err) {
+        const payloadSha = event.pull_request?.number === number ? event.pull_request?.head?.sha : null;
+        const sha = reportSha ?? input?.headSha ?? payloadSha;
+        if (HEX_SHA.test(String(sha))) {
+          await failClosed(String(sha), `could not evaluate PR #${number}: ${err.message}`);
+        }
+        throw err;
       }
-      if (reportSha) result.details = { ...result.details, mergeGroup: { headSha: reportSha, number } };
-      await writeCheck(client, repo, reportSha ?? input.headSha, result, report);
-      log(`review-policy: #${number} ${result.pass ? 'PASS' : 'FAIL'}: ${result.reason}`);
-      summary(`#${number}`, result);
-      results.push({ number, ...result });
     }
     return results;
   } finally {
