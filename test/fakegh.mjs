@@ -55,7 +55,12 @@ export function fakeGitHub(state) {
   ];
   const routes = [
     ['GET', /^\/pulls\/(\d+)$/, (m) => (state.prs[m[1]] ? [200, state.prs[m[1]].pull] : [404, { message: 'Not Found' }])],
-    ['GET', /^\/pulls$/, (m, url) => page(Object.values(state.prs).map((p) => p.pull), url)],
+    ['GET', /^\/pulls$/, (m, url) => {
+      const want = url.searchParams.get('state');
+      let all = Object.values(state.prs).map((p) => p.pull);
+      if (want && want !== 'all') all = all.filter((p) => (p.state ?? 'open') === want);
+      return page(all, url);
+    }],
     ['GET', /^\/pulls\/(\d+)\/files$/, (m, url) => page(state.prs[m[1]].files, url)],
     ['GET', /^\/pulls\/(\d+)\/reviews$/, (m, url) => page(state.prs[m[1]].reviews, url)],
     ['GET', /^\/issues\/(\d+)\/timeline$/, (m, url) => page(state.prs[m[1]].timeline, url)],

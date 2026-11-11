@@ -539,6 +539,26 @@ describe('fail closed on errors', () => {
     const e = env('pull_request_target', { pull_request: { number: 7, head: { sha: HEAD } } });
     await assert.rejects(run({ env: e, fetch: gh.fetch, log: quiet }), /503/);
   });
+
+  test('workflow_run fails closed on the run head when gathering fails', async () => {
+    const gh = world(prState({ reviews: [review(1, BOT)] }), { errors: { 'GET /pulls/7/reviews': 503 } });
+    const e = env('workflow_run', { workflow_run: { head_sha: HEAD, pull_requests: [] } });
+    await assert.rejects(run({ env: e, fetch: gh.fetch, log: quiet }), /503/);
+    assert.equal(gh.state.checkRuns.length, 1);
+    assert.equal(gh.state.checkRuns[0].head_sha, HEAD);
+    assert.equal(gh.state.checkRuns[0].conclusion, 'failure');
+    assert.match(gh.state.checkRuns[0].output.title, /could not evaluate PR #7/);
+  });
+
+  test('workflow_dispatch fails closed on the PR head once it is known', async () => {
+    const gh = world(prState({ reviews: [review(1, BOT)] }), { errors: { 'GET /pulls/7/reviews': 503 } });
+    const e = env('workflow_dispatch', { inputs: { pr: '7' } });
+    await assert.rejects(run({ env: e, fetch: gh.fetch, log: quiet }), /503/);
+    assert.equal(gh.state.checkRuns.length, 1);
+    assert.equal(gh.state.checkRuns[0].head_sha, HEAD);
+    assert.equal(gh.state.checkRuns[0].conclusion, 'failure');
+    assert.match(gh.state.checkRuns[0].output.title, /could not evaluate PR #7/);
+  });
 });
 
 describe('shared head commit', () => {
@@ -613,6 +633,50 @@ describe('shared head commit', () => {
     const [r] = await run({ env: env('pull_request_target', { pull_request: { number: 7 } }), fetch: gh.fetch, log: quiet });
     assert.equal(r.pass, true, r.reason);
     assert.ok(!gh.calls.some((c) => c.includes('/pulls/8/')));
+  });
+
+  test('a closed target is left out of the verdict on its own head', async () => {
+    // #7 passes alone. #8 was its unlabeled twin, now closed; the closed
+    // event targets #8 and must restore #7's verdict, not report #8's.
+    const gh = world(prState({ reviews: [review(1, BOT)] }));
+    gh.state.prs[8] = twin({ pull: { state: 'closed' } });
+    const [r] = await run({
+      env: env('pull_request_target', { action: 'closed', pull_request: { number: 8, head: { sha: HEAD } } }),
+      fetch: gh.fetch,
+      log: quiet,
+    });
+    assert.equal(r.pass, true, r.reason);
+    assert.match(r.reason, /head shared by #7 \(#8 closed\), all passing; #7: LOW: bot approval/);
+    assert.equal(gh.state.checkRuns.length, 1);
+    assert.equal(gh.state.checkRuns[0].head_sha, HEAD);
+    assert.equal(gh.state.checkRuns[0].conclusion, 'success');
+  });
+
+  test('a closed target whose open twins fail still fails closed', async () => {
+    const gh = world(prState({ reviews: [review(1, BOT)] }));
+    gh.state.prs[8] = twin({ pull: { state: 'closed' } });
+    gh.state.prs[7].pull.labels = [];
+    gh.state.prs[7].timeline = [];
+    const [r] = await run({
+      env: env('pull_request_target', { action: 'closed', pull_request: { number: 8, head: { sha: HEAD } } }),
+      fetch: gh.fetch,
+      log: quiet,
+    });
+    assert.equal(r.pass, false);
+    assert.match(r.reason, /head shared by #7 \(#8 closed\); strictest, from #7: needs severity/);
+    assert.equal(gh.state.checkRuns[0].conclusion, 'failure');
+  });
+
+  test('a closed target with no open twin writes nothing', async () => {
+    const gh = world(prState({ reviews: [review(1, BOT)] }));
+    gh.state.prs[7].pull.state = 'closed';
+    const results = await run({
+      env: env('pull_request_target', { action: 'closed', pull_request: { number: 7, head: { sha: HEAD } } }),
+      fetch: gh.fetch,
+      log: quiet,
+    });
+    assert.deepEqual(results, []);
+    assert.equal(gh.writes.length, 0);
   });
 });
 

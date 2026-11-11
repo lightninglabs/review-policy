@@ -245,9 +245,11 @@ head would otherwise overwrite each other's result: a looser PR could PASS
 over a stricter one's FAIL, and anyone could open an unlabeled twin to
 write FAIL over a PASS. When the PR being evaluated shares its head with
 other open PRs, the check evaluates every one of them and reports the
-strictest result, failing closed in both directions. Closing a twin
-re-triggers the remaining PR through the `closed` event and restores its
-own verdict.
+strictest result, failing closed in both directions. A run whose target
+PR is closed reports only on the open PRs that share the head — the closed
+PR's verdict no longer applies — and writes nothing when no open PR is
+left on the commit. Closing a twin therefore restores the survivor's own
+verdict through the `closed` event.
 
 The same fail-closed rule covers errors: any failure to gather inputs or
 evaluate writes a failing check on the target commit before the run exits,

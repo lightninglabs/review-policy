@@ -1010,7 +1010,8 @@ export function parseMergeGroupRef(ref) {
 
 // prTargets works out which PRs an event is about. Each target is
 // {number}, plus for merge_group the commit to report on and the base
-// branch the PR must target.
+// branch the PR must target, and for workflow_run the run's head commit,
+// so a failed run can still fail closed on it.
 export async function prTargets(client, repo, eventName, event) {
   const nums = (list) => list.map((number) => ({ number }));
   switch (eventName) {
@@ -1045,7 +1046,8 @@ export async function prTargets(client, repo, eventName, event) {
         const open = await client.paginate(`/repos/${repo}/pulls`, { query: { state: 'open' } });
         for (const p of open) if (p.head?.sha === run.head_sha) nums.add(p.number);
       }
-      return [...nums].sort((a, b) => a - b).map((number) => ({ number }));
+      const headSha = HEX_SHA.test(String(run.head_sha)) ? String(run.head_sha) : undefined;
+      return [...nums].sort((a, b) => a - b).map((number) => ({ number, headSha }));
     }
     default:
       throw new Error(`unsupported event "${eventName}"`);
@@ -1110,46 +1112,56 @@ async function compareFiles(client, repo, base, head) {
 }
 
 // gatherInputs reads everything evaluate() needs from the API. The
-// config comes from the base branch, never from the PR.
+// config comes from the base branch, never from the PR. If anything after
+// the PR fetch itself fails, the error carries the PR's head commit, so
+// the caller can still fail closed on it.
 export async function gatherInputs(client, repo, number, { appLogin = null } = {}) {
   const pr = await client.request('GET', `/repos/${repo}/pulls/${number}`);
-  const [cfg, files, timeline, reviews] = await Promise.all([
-    readConfig(client, repo, pr.base.ref),
-    client.paginate(`/repos/${repo}/pulls/${number}/files`),
-    client.paginate(`/repos/${repo}/issues/${number}/timeline`),
-    client.paginate(`/repos/${repo}/pulls/${number}/reviews`),
-  ]);
-  const input = {
-    ...cfg,
-    files: files.map((f) => ({ filename: f.filename, previous_filename: f.previous_filename })),
-    filesTotal: pr.changed_files,
-    labels: (pr.labels ?? []).map((l) => l.name),
-    timeline: timeline
-      .filter((e) => e.event === 'labeled' || e.event === 'unlabeled')
-      .map((e) => ({ event: e.event, label: e.label?.name, actor: e.actor?.login })),
-    reviews: reviews.map((r) => ({
-      id: r.id,
-      user: r.user?.login,
-      state: r.state,
-      commitId: r.commit_id,
-      submittedAt: r.submitted_at,
-    })),
-    author: pr.user?.login,
-    headSha: pr.head.sha,
-    baseRef: pr.base.ref,
-    appLogin,
-    permissions: {},
-    changesSince: {},
-  };
-  for (const login of actorsToCheck(input)) {
-    input.permissions[login] = await permission(client, repo, login);
-  }
-  if (Object.values(input.config?.tiers ?? {}).some((t) => t.carry)) {
-    for (const sha of staleApprovalCommits(input)) {
-      input.changesSince[sha] = await compareFiles(client, repo, sha, input.headSha);
+  try {
+    const [cfg, files, timeline, reviews] = await Promise.all([
+      readConfig(client, repo, pr.base.ref),
+      client.paginate(`/repos/${repo}/pulls/${number}/files`),
+      client.paginate(`/repos/${repo}/issues/${number}/timeline`),
+      client.paginate(`/repos/${repo}/pulls/${number}/reviews`),
+    ]);
+    const input = {
+      ...cfg,
+      files: files.map((f) => ({ filename: f.filename, previous_filename: f.previous_filename })),
+      filesTotal: pr.changed_files,
+      labels: (pr.labels ?? []).map((l) => l.name),
+      timeline: timeline
+        .filter((e) => e.event === 'labeled' || e.event === 'unlabeled')
+        .map((e) => ({ event: e.event, label: e.label?.name, actor: e.actor?.login })),
+      reviews: reviews.map((r) => ({
+        id: r.id,
+        user: r.user?.login,
+        state: r.state,
+        commitId: r.commit_id,
+        submittedAt: r.submitted_at,
+      })),
+      author: pr.user?.login,
+      headSha: pr.head.sha,
+      baseRef: pr.base.ref,
+      state: pr.state ?? 'open',
+      appLogin,
+      permissions: {},
+      changesSince: {},
+    };
+    for (const login of actorsToCheck(input)) {
+      input.permissions[login] = await permission(client, repo, login);
     }
+    if (Object.values(input.config?.tiers ?? {}).some((t) => t.carry)) {
+      for (const sha of staleApprovalCommits(input)) {
+        input.changesSince[sha] = await compareFiles(client, repo, sha, input.headSha);
+      }
+    }
+    return input;
+  } catch (err) {
+    if (err && typeof err === 'object' && !err.headSha && HEX_SHA.test(String(pr.head?.sha))) {
+      err.headSha = pr.head.sha;
+    }
+    throw err;
   }
-  return input;
 }
 
 export function summarize(result, { spoofable = false } = {}) {
@@ -1234,11 +1246,18 @@ async function authenticate(env, repo, fetch, log) {
 // stricter one's FAIL, and anyone could open an unlabeled twin to write
 // FAIL over a PASS. Reporting the strictest fails closed in both
 // directions.
+//
+// A closed target PR (say the event is pull_request_target "closed") is
+// left out of the verdict: it is not going anywhere, and its result must
+// not drag down the open PRs that share its head. When no open PR is left
+// on the head there is nothing the check can protect, and null is
+// returned.
 async function evaluateSharedHead(client, repo, open, number, input, appLogin) {
   const twins = open.filter((p) => p.number !== number && p.head?.sha === input.headSha);
-  const result = evaluate(input);
-  if (twins.length === 0) return result;
-  const verdicts = [{ number, result }];
+  const closed = input.state !== 'open';
+  if (twins.length === 0) return closed ? null : evaluate(input);
+  const verdicts = [];
+  if (!closed) verdicts.push({ number, result: evaluate(input) });
   for (const twin of twins) {
     const twinInput = await gatherInputs(client, repo, twin.number, { appLogin });
     verdicts.push({ number: twin.number, result: evaluate(twinInput) });
@@ -1246,7 +1265,7 @@ async function evaluateSharedHead(client, repo, open, number, input, appLogin) {
   verdicts.sort((a, b) => a.number - b.number);
   const failing = verdicts.filter((v) => !v.result.pass);
   const sharedHead = verdicts.map((v) => v.number);
-  const asList = sharedHead.map((n) => `#${n}`).join(', ');
+  const asList = sharedHead.map((n) => `#${n}`).join(', ') + (closed ? ` (#${number} closed)` : '');
   if (failing.length > 0) {
     const strictest = failing[0];
     const others = failing.length > 1 ? ` (${failing.length - 1} more failing)` : '';
@@ -1256,10 +1275,10 @@ async function evaluateSharedHead(client, repo, open, number, input, appLogin) {
       details: { ...strictest.result.details, sharedHead },
     };
   }
-  const own = verdicts.find((v) => v.number === number);
+  const own = closed ? verdicts[0] : verdicts.find((v) => v.number === number);
   return {
     ...own.result,
-    reason: `head shared by ${asList}, all passing; #${number}: ${own.result.reason}`,
+    reason: `head shared by ${asList}, all passing; #${own.number}: ${own.result.reason}`,
     details: { ...own.result.details, sharedHead },
   };
 }
@@ -1318,7 +1337,7 @@ export async function run({ env = process.env, fetch = globalThis.fetch, log = c
     // can be evaluated together. merge_group reports on its own head and
     // does not need the list.
     let open = null;
-    for (const { number, reportSha, base } of targets) {
+    for (const { number, reportSha, base, headSha } of targets) {
       let input;
       try {
         input = await gatherInputs(client, repo, number, { appLogin });
@@ -1328,6 +1347,10 @@ export async function run({ env = process.env, fetch = globalThis.fetch, log = c
           result = await evaluateSharedHead(client, repo, open, number, input, appLogin);
         } else {
           result = evaluate(input);
+        }
+        if (result === null) {
+          log(`review-policy: #${number} is closed and no open PR shares its head; nothing to report`);
+          continue;
         }
         if (base !== undefined && input.baseRef !== base) {
           result = { ...result, pass: false, reason: `PR #${number} targets ${input.baseRef}, not the merge group's base ${base}` };
@@ -1339,7 +1362,7 @@ export async function run({ env = process.env, fetch = globalThis.fetch, log = c
         results.push({ number, ...result });
       } catch (err) {
         const payloadSha = event.pull_request?.number === number ? event.pull_request?.head?.sha : null;
-        const sha = reportSha ?? input?.headSha ?? payloadSha;
+        const sha = reportSha ?? input?.headSha ?? err?.headSha ?? headSha ?? payloadSha;
         if (HEX_SHA.test(String(sha))) {
           await failClosed(String(sha), `could not evaluate PR #${number}: ${err.message}`);
         }
