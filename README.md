@@ -7,8 +7,9 @@ The repository ruleset asks for one approval. This check raises that bar for
 riskier PRs. It makes no model calls and never runs PR code, and it reaches
 the same answer every time for the same inputs.
 
-> **Status:** design. The implementation is tracked in
-> [#1](https://github.com/lightninglabs/review-policy/issues/1).
+> **Status:** v1 implemented (tracked in
+> [#1](https://github.com/lightninglabs/review-policy/issues/1)). Not yet
+> deployed to any repository.
 
 ## The policy at a glance
 
@@ -190,6 +191,40 @@ to that repository's paths.
 | Experts | Applies only if the expert is the PR author and every floored path the PR touches matches one of their globs. Lowers the requirement by one, never below one human at CRITICAL. |
 | Never auto-approve | If any changed path matches, a bot approval satisfies nothing |
 
+### Implementation details
+
+Where the design above leaves room, v1 does this:
+
+- **Labels** are `severity-low`, `-medium`, `-high`, `-critical`. If several
+  valid ones are present, the highest wins. The App's labels count when its
+  bot login (`<app-slug>[bot]`, looked up from `app_id`, or the `app_login`
+  input) applied them. `github-actions[bot]` never counts, even if configured.
+- **Approvers** must have write access to count as humans, as GitHub itself
+  requires. `COMMENTED` reviews don't change a reviewer's latest state, as on
+  GitHub; `CHANGES_REQUESTED` and dismissals do.
+- **`bot: true`** on a tier adds one approval that the bot or another human can
+  give. So LOW needs the bot or one human.
+- **`carry: low_only`** compares the approved commit with the head through the
+  compare API. The approval carries only if the head descends from that
+  commit, fewer than 300 files changed (the API's limit), and none of them is
+  floored, never-auto-approve, or the policy file. A tier can't set both
+  `fresh` and `carry`. A tier with neither keeps older human approvals.
+- **Experts** get relief only if the PR touches at least one floored path and
+  doesn't edit the policy file. The relief never takes the requirement to
+  zero approvals: an expert at LOW, MEDIUM, or HIGH still needs the bot on the
+  head or one human.
+- **The policy file** counts as a CRITICAL floored path and a
+  never-auto-approve path, whatever the config says.
+- **Globs** match whole paths: `**` is any number of directories, `*` and `?`
+  stay inside one directory. A pattern without a slash, like `go.mod`, only
+  matches at the root.
+- **The config parser** is built in and accepts a strict YAML subset: block
+  and flow mappings and lists, quoted and plain scalars, comments. Anchors,
+  tags, and block scalars are errors. Unknown keys are errors, so a typo
+  fails closed. Quote globs that start with `*`, and logins inside `[...]`
+  lists, as YAML itself requires.
+- **More than 3000 changed files**, the API's limit, fails the check.
+
 ## Merge queue
 
 Required checks must report on `merge_group` events too, or queued PRs wait
@@ -202,6 +237,24 @@ commit. A queue entry passes when its PR still meets the policy. Approvals and
 labels are not re-collected from the queue commit, since the queue commit has
 no reviews of its own.
 
+## Shared head commits
+
+The verdict is per PR — author, labels, reviews, and base branch all feed
+it — but a check run is keyed by head commit. Two open PRs with the same
+head would otherwise overwrite each other's result: a looser PR could PASS
+over a stricter one's FAIL, and anyone could open an unlabeled twin to
+write FAIL over a PASS. When the PR being evaluated shares its head with
+other open PRs, the check evaluates every one of them and reports the
+strictest result, failing closed in both directions. A run whose target
+PR is closed reports only on the open PRs that share the head — the closed
+PR's verdict no longer applies — and writes nothing when no open PR is
+left on the commit. Closing a twin therefore restores the survivor's own
+verdict through the `closed` event.
+
+The same fail-closed rule covers errors: any failure to gather inputs or
+evaluate writes a failing check on the target commit before the run exits,
+so an earlier PASS cannot stand in for a run that never finished.
+
 ## Using it in a repository
 
 Two short workflows, both running from the default branch:
@@ -211,7 +264,10 @@ Two short workflows, both running from the default branch:
 name: review-policy
 on:
   pull_request_target:
-    types: [opened, synchronize, reopened, labeled, unlabeled, ready_for_review]
+    # edited: retargeting at another base branch re-evaluates against that
+    # base's policy. closed: a PR sharing its head with a closed twin is
+    # re-evaluated on its own (see "Shared head commits").
+    types: [opened, synchronize, reopened, labeled, unlabeled, ready_for_review, edited, closed]
   merge_group:
   workflow_run:
     workflows: [review-policy-relay]
@@ -261,6 +317,57 @@ Then, in the repository ruleset, in **one** change:
 Roll it out as a non-required check first and compare its verdicts with real
 merges before making it required.
 
+### Setting up the App key
+
+1. Under **Settings → Environments**, create `review-policy`. Set
+   **Deployment branches** to **Selected branches** and allow only the default
+   branch.
+2. Add the App's private key there as the secret `REVIEW_POLICY_APP_KEY`, and
+   its id as the variable `REVIEW_POLICY_APP_ID`.
+
+One caveat to validate before relying on the key: it is not yet confirmed
+against a live repository how GitHub applies the deployment-branch policy to
+`merge_group` jobs, whose ref is `refs/heads/gh-readonly-queue/<base>/...`,
+or to `pull_request_target` jobs for PRs that target a non-default branch. If
+the policy rejects those refs, merge-queue entries get no check and stall,
+and release-branch PRs are unchecked. Widening the policy to
+`gh-readonly-queue/*` needs a ruleset that blocks users from creating refs
+with that prefix, or anyone who can push such a branch can read the key. The
+`merge_group` path has so far been exercised only against a fake API. Until
+this is settled, the GITHUB_TOKEN fallback is the safe way to trial the
+check.
+
+The action signs a JWT with the key (RS256, built-in `node:crypto`), mints an
+installation token limited to this repository with `checks: write`,
+`contents: read`, and `pull-requests: read`, uses it for every API call, and
+revokes it when done. If `app_id` is set but `private_key` is empty, as it is
+for a job outside the environment or off the default branch, the run fails
+instead of falling back.
+
+Without `app_id` and `private_key`, the action falls back to the `token` input
+(`GITHUB_TOKEN` by default), which then needs `checks: write` and
+`pull-requests: read`. Every summary it writes then starts with a warning that
+the check can be spoofed, since any workflow can create a check run with the
+same name. Use this only while trying the check out.
+
+Optional inputs: `app_login` overrides the login whose labels count, and
+`token` is the fallback token.
+
+On `merge_group`, a ref that doesn't parse, or whose base doesn't match the
+event's `base_ref`, gets a failing check on the group's head commit and the
+run fails. So does a PR that no longer targets the queue's base branch.
+`workflow_dispatch` with a `pr` input re-runs the check for one PR.
+
+## Development
+
+```sh
+node --test test/*.test.mjs   # unit and end-to-end tests, no network
+node scripts/build.mjs        # rebuild dist/ after changing src/
+```
+
+`src/policy.mjs` is the pure evaluation; `src/main.mjs` does the GitHub I/O.
+The tests fail if `dist/` is out of date.
+
 ## Open questions
 
 - Should a push invalidate the severity label itself, forcing reclassification?
@@ -268,6 +375,9 @@ merges before making it required.
   head, which covers the LOW path; a stricter option is to treat a label
   applied before the latest push as stale.
 - Who creates and owns the review bot user and the review-policy App?
+- Does the `review-policy` environment's deployment-branch policy admit
+  `merge_group` and non-default-base `pull_request_target` jobs on a live
+  repository? See "Setting up the App key".
 
 ## Related
 
